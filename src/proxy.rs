@@ -131,7 +131,12 @@ async fn batch_response(
     let notify = state.notifier(&job.id).await;
     state
         .clone()
-        .start_poller(job.id.clone(), job.attempt, auth, request.batch_body.clone())
+        .start_poller(
+            job.id.clone(),
+            job.attempt,
+            auth,
+            request.batch_body.clone(),
+        )
         .await;
 
     let job_id = job.id.clone();
@@ -253,8 +258,7 @@ async fn batch_response(
         .insert("x-kaiion-mode", HeaderValue::from_static("batch"));
     response.headers_mut().insert(
         "x-kaiion-job-id",
-        HeaderValue::from_str(&job.id)
-            .map_err(|error| ProxyError::Internal(error.to_string()))?,
+        HeaderValue::from_str(&job.id).map_err(|error| ProxyError::Internal(error.to_string()))?,
     );
     Ok(response)
 }
@@ -285,10 +289,7 @@ impl AppState {
         tokio::spawn(async move {
             info!(%job_id, attempt, "starting batch poller");
             loop {
-                match self
-                    .drive_job(&job_id, attempt, &auth, &request_body)
-                    .await
-                {
+                match self.drive_job(&job_id, attempt, &auth, &request_body).await {
                     Ok(true) => break,
                     Ok(false) => {}
                     Err(error) if error.retryable() => {
@@ -366,11 +367,7 @@ impl AppState {
         }
 
         if job.status == "submitting" {
-            let batch = match self
-                .upstream
-                .find_batch(auth, &job.id, job.attempt)
-                .await?
-            {
+            let batch = match self.upstream.find_batch(auth, &job.id, job.attempt).await? {
                 Some(batch) => batch,
                 None => {
                     let input_file_id = job.input_file_id.as_deref().ok_or_else(|| {
@@ -469,9 +466,7 @@ impl AppState {
                         "status": batch.status
                     }))?
                 };
-                self.db
-                    .mark_failed(&job.id, &batch.status, &error)
-                    .await?;
+                self.db.mark_failed(&job.id, &batch.status, &error).await?;
                 self.notifier(&job.id).await.notify_waiters();
                 Ok(true)
             }
@@ -502,9 +497,9 @@ fn parse_batch_output(content: &str, custom_id: &str) -> Result<Value, ProxyErro
         if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
             return Err(ProxyError::BatchResult(error.to_string()));
         }
-        let response = value.get("response").ok_or_else(|| {
-            ProxyError::Internal("batch output has no response".to_string())
-        })?;
+        let response = value
+            .get("response")
+            .ok_or_else(|| ProxyError::Internal("batch output has no response".to_string()))?;
         let status = response
             .get("status_code")
             .and_then(Value::as_u64)
@@ -551,7 +546,10 @@ fn normalize_batch_error(content: &str, custom_id: &str, model: &str) -> String 
             })
             .to_string();
         }
-        if let Some(body) = value.pointer("/response/body").filter(|body| body.is_object()) {
+        if let Some(body) = value
+            .pointer("/response/body")
+            .filter(|body| body.is_object())
+        {
             return body.to_string();
         }
     }
@@ -571,7 +569,6 @@ mod tests {
         let response = parse_batch_output(content, "wanted").unwrap();
         assert_eq!(response["id"], "resp_1");
     }
-
 
     #[test]
     fn converts_an_error_file_line_to_a_failed_response() {

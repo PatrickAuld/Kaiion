@@ -8,4 +8,3 @@ pub mod sse;
 
 pub use config::Config;
 pub use proxy::build_router;
-

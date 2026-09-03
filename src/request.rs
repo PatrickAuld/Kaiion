@@ -128,7 +128,10 @@ fn extract_session_key(client_metadata: Option<&Value>) -> Option<String> {
         .get("thread_id")
         .and_then(Value::as_str)
         .or_else(|| metadata.get("session_id").and_then(Value::as_str))?;
-    let turn = metadata.get("turn_id").and_then(Value::as_str).unwrap_or("-");
+    let turn = metadata
+        .get("turn_id")
+        .and_then(Value::as_str)
+        .unwrap_or("-");
     let mut hasher = Sha256::new();
     hasher.update(thread.as_bytes());
     hasher.update([0]);

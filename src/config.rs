@@ -31,11 +31,7 @@ pub struct Config {
     )]
     pub upstream_base_url: String,
 
-    #[arg(
-        long,
-        env = "KAIION_POLL_INTERVAL_SECONDS",
-        default_value_t = 5
-    )]
+    #[arg(long, env = "KAIION_POLL_INTERVAL_SECONDS", default_value_t = 5)]
     pub poll_interval_seconds: u64,
 
     #[arg(
@@ -45,11 +41,7 @@ pub struct Config {
     )]
     pub in_progress_interval_seconds: u64,
 
-    #[arg(
-        long,
-        env = "KAIION_MAX_BODY_BYTES",
-        default_value_t = 67_108_864
-    )]
+    #[arg(long, env = "KAIION_MAX_BODY_BYTES", default_value_t = 67_108_864)]
     pub max_body_bytes: usize,
 }
 
@@ -62,4 +54,3 @@ impl Config {
         Duration::from_secs(self.in_progress_interval_seconds.max(1))
     }
 }
-

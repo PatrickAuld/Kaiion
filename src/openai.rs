@@ -85,7 +85,9 @@ impl OpenAiClient {
             .timeout(CONTROL_REQUEST_TIMEOUT)
             .send()
             .await?;
-        self.parse_json::<FileObject>(response).await.map(|file| file.id)
+        self.parse_json::<FileObject>(response)
+            .await
+            .map(|file| file.id)
     }
 
     pub async fn create_batch(
@@ -178,8 +180,7 @@ impl OpenAiClient {
     ) -> Result<String, ProxyError> {
         let response = self
             .with_auth(
-                self.http
-                    .get(self.url(&format!("files/{file_id}/content"))),
+                self.http.get(self.url(&format!("files/{file_id}/content"))),
                 auth,
             )
             .timeout(CONTROL_REQUEST_TIMEOUT)

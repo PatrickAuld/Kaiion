@@ -78,7 +78,10 @@ impl FakeProvider {
             .route("/v1/responses", post(fake_direct_response))
             .route("/v1/files", post(fake_upload_file))
             .route("/v1/files/{id}/content", get(fake_file_content))
-            .route("/v1/batches", post(fake_create_batch).get(fake_list_batches))
+            .route(
+                "/v1/batches",
+                post(fake_create_batch).get(fake_list_batches),
+            )
             .route("/v1/batches/{id}", get(fake_get_batch))
             .with_state(self)
     }
@@ -127,7 +130,12 @@ async fn fake_direct_response(
     Json(request): Json<Value>,
 ) -> Response {
     provider.record_call("responses", &headers).await;
-    provider.inner.direct_requests.lock().await.push(request.clone());
+    provider
+        .inner
+        .direct_requests
+        .lock()
+        .await
+        .push(request.clone());
     let mut response = Response::new(Body::from(DIRECT_SSE));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -147,11 +155,7 @@ async fn fake_upload_file(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     provider.record_call("files", &headers).await;
     let mut content = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(internal_test_error)?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(internal_test_error)? {
         if field.name() == Some("file") {
             content = Some(field.text().await.map_err(internal_test_error)?);
         }
@@ -163,10 +167,7 @@ async fn fake_upload_file(
         .map(|line| serde_json::from_str(line).map_err(internal_test_error))
         .collect::<Result<Vec<Value>, _>>()?;
     if lines.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "batch input is empty".to_string(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "batch input is empty".to_string()));
     }
     provider
         .inner
@@ -191,7 +192,12 @@ async fn fake_create_batch(
     Json(request): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     provider.record_call("batches", &headers).await;
-    provider.inner.batch_requests.lock().await.push(request.clone());
+    provider
+        .inner
+        .batch_requests
+        .lock()
+        .await
+        .push(request.clone());
     let input_file_id = request["input_file_id"]
         .as_str()
         .ok_or((StatusCode::BAD_REQUEST, "missing input_file_id".to_string()))?
@@ -492,7 +498,8 @@ impl FakeCodex {
     }
 
     async fn send(&self, request: &Value) -> CodexStream {
-        self.send_with_headers(request, "test-key", None, None).await
+        self.send_with_headers(request, "test-key", None, None)
+            .await
     }
 
     async fn send_with_headers(
@@ -586,7 +593,9 @@ fn take_sse_event(buffer: &mut Vec<u8>) -> Option<SseEvent> {
 }
 
 fn events_contain(events: &[SseEvent], needle: &str) -> bool {
-    events.iter().any(|event| event.data.to_string().contains(needle))
+    events
+        .iter()
+        .any(|event| event.data.to_string().contains(needle))
 }
 
 async fn wait_for_batch(provider: &FakeProvider) {
@@ -668,7 +677,10 @@ async fn direct_mode_passes_through_sse_and_authorization() {
     assert_eq!(response.headers[header::CONTENT_TYPE], "text/event-stream");
     assert_eq!(response.all_bytes().await, DIRECT_SSE.as_bytes());
     assert_eq!(provider.batch_creations(), 0);
-    assert_eq!(provider.inner.direct_requests.lock().await.as_slice(), &[request]);
+    assert_eq!(
+        provider.inner.direct_requests.lock().await.as_slice(),
+        &[request]
+    );
     assert_all_calls_use_credentials(
         &provider,
         "direct-key",
@@ -729,9 +741,11 @@ async fn batch_mode_emits_progress_and_translates_the_result_to_sse() {
 
     let events = response.through_terminal().await;
     assert!(events_contain(&events, "batch response"));
-    assert!(events
-        .iter()
-        .any(|event| event.kind == "response.output_item.done"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == "response.output_item.done")
+    );
     assert_eq!(events.last().unwrap().kind, "response.completed");
     let terminal_events = events
         .iter()
@@ -785,8 +799,15 @@ async fn client_disconnect_does_not_cancel_the_batch_or_create_a_duplicate() {
 
     let mut first = codex.send(&codex_request("window-first")).await;
     assert_eq!(first.status, StatusCode::OK);
-    let job_id = first.headers["x-kaiion-job-id"].to_str().unwrap().to_string();
-    assert!(expect_batch_lifecycle_start(&mut first).await.starts_with("resp_kaiion_"));
+    let job_id = first.headers["x-kaiion-job-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        expect_batch_lifecycle_start(&mut first)
+            .await
+            .starts_with("resp_kaiion_")
+    );
     drop(first);
     wait_for_batch(&provider).await;
 
@@ -796,9 +817,11 @@ async fn client_disconnect_does_not_cancel_the_batch_or_create_a_duplicate() {
         duplicate.headers["x-kaiion-job-id"].to_str().unwrap(),
         job_id
     );
-    assert!(expect_batch_lifecycle_start(&mut duplicate)
-        .await
-        .starts_with("resp_kaiion_"));
+    assert!(
+        expect_batch_lifecycle_start(&mut duplicate)
+            .await
+            .starts_with("resp_kaiion_")
+    );
     assert_eq!(provider.batch_creations(), 1);
     drop(duplicate);
 
@@ -827,17 +850,21 @@ async fn identical_requests_with_different_api_keys_are_not_deduplicated() {
     let mut first = codex
         .send_with_headers(&request, "tenant-a", None, None)
         .await;
-    assert!(expect_batch_lifecycle_start(&mut first)
-        .await
-        .starts_with("resp_kaiion_"));
+    assert!(
+        expect_batch_lifecycle_start(&mut first)
+            .await
+            .starts_with("resp_kaiion_")
+    );
     wait_for_batch_count(&provider, 1).await;
 
     let mut second = codex
         .send_with_headers(&request, "tenant-b", None, None)
         .await;
-    assert!(expect_batch_lifecycle_start(&mut second)
-        .await
-        .starts_with("resp_kaiion_"));
+    assert!(
+        expect_batch_lifecycle_start(&mut second)
+            .await
+            .starts_with("resp_kaiion_")
+    );
     wait_for_batch_count(&provider, 2).await;
     assert_ne!(
         first.headers["x-kaiion-job-id"],
@@ -845,7 +872,10 @@ async fn identical_requests_with_different_api_keys_are_not_deduplicated() {
     );
 
     provider.complete_all().await;
-    assert_eq!(first.through_terminal().await.last().unwrap().kind, "response.completed");
+    assert_eq!(
+        first.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
     assert_eq!(
         second.through_terminal().await.last().unwrap().kind,
         "response.completed"
@@ -874,9 +904,11 @@ async fn restart_reuses_the_batch_and_replays_its_result() {
     let first_process = start_kaiion("batch", &database, fake.address).await;
     let first_codex = FakeCodex::new(first_process.address);
     let mut first_stream = first_codex.send(&codex_request("window-before")).await;
-    assert!(expect_batch_lifecycle_start(&mut first_stream)
-        .await
-        .starts_with("resp_kaiion_"));
+    assert!(
+        expect_batch_lifecycle_start(&mut first_stream)
+            .await
+            .starts_with("resp_kaiion_")
+    );
     wait_for_batch(&provider).await;
     drop(first_stream);
     first_process.stop().await;
@@ -901,9 +933,6 @@ async fn restart_reuses_the_batch_and_replays_its_result() {
     assert!(events_contain(&replayed_events, "batch response"));
     assert_eq!(replayed_events.last().unwrap().kind, "response.completed");
     assert_eq!(provider.batch_creations(), 1);
-    assert_eq!(
-        provider.calls().await.len(),
-        upstream_calls
-    );
+    assert_eq!(provider.calls().await.len(), upstream_calls);
     third_process.stop().await;
 }

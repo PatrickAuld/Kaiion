@@ -37,7 +37,10 @@ pub fn completed_events(response: &Value) -> Result<Vec<Bytes>, ProxyError> {
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| ProxyError::Internal("batch response is missing model".to_string()))?;
-    let mut events = vec![created_event(response_id, model, 0), in_progress_event(response_id, model, 1)];
+    let mut events = vec![
+        created_event(response_id, model, 0),
+        in_progress_event(response_id, model, 1),
+    ];
     events.extend(completion_events(response, response_id, 2)?);
     Ok(events)
 }
@@ -56,9 +59,9 @@ pub fn completion_events(
         .ok_or_else(|| ProxyError::Internal("batch response is missing output".to_string()))?;
 
     let mut completed_response = response.clone();
-    let object = completed_response.as_object_mut().ok_or_else(|| {
-        ProxyError::Internal("batch response is not a JSON object".to_string())
-    })?;
+    let object = completed_response
+        .as_object_mut()
+        .ok_or_else(|| ProxyError::Internal("batch response is not a JSON object".to_string()))?;
     object.insert("id".to_string(), Value::String(response_id.to_string()));
 
     let mut sequence = first_sequence_number;

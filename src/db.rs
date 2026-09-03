@@ -117,13 +117,13 @@ impl Database {
         auth_hash: &str,
         request_hash: &str,
     ) -> Result<Option<Job>, ProxyError> {
-        Ok(sqlx::query_as::<_, Job>(
-            "SELECT * FROM jobs WHERE auth_hash = ? AND request_hash = ?",
+        Ok(
+            sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE auth_hash = ? AND request_hash = ?")
+                .bind(auth_hash)
+                .bind(request_hash)
+                .fetch_optional(&self.pool)
+                .await?,
         )
-        .bind(auth_hash)
-        .bind(request_hash)
-        .fetch_optional(&self.pool)
-        .await?)
     }
 
     pub async fn mark_other_requests_delivered(
