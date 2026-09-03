@@ -408,23 +408,23 @@ impl AppState {
             "completed" => {
                 // A one-request Batch can complete with its failure recorded
                 // only in the error file, with no output file at all.
-                if batch.output_file_id.is_none() {
-                    if let Some(file_id) = &batch.error_file_id {
-                        let error = match self.upstream.get_file_content(auth, file_id).await {
-                            Ok(error) => error,
-                            Err(ProxyError::Upstream { status, .. })
-                                if status == StatusCode::NOT_FOUND
-                                    || status == StatusCode::CONFLICT =>
-                            {
-                                return Ok(false);
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let error = normalize_batch_error(&error, &job.custom_id(), &job.model);
-                        self.db.mark_failed(&job.id, "failed", &error).await?;
-                        self.notifier(&job.id).await.notify_waiters();
-                        return Ok(true);
-                    }
+                if batch.output_file_id.is_none()
+                    && let Some(file_id) = &batch.error_file_id
+                {
+                    let error = match self.upstream.get_file_content(auth, file_id).await {
+                        Ok(error) => error,
+                        Err(ProxyError::Upstream { status, .. })
+                            if status == StatusCode::NOT_FOUND
+                                || status == StatusCode::CONFLICT =>
+                        {
+                            return Ok(false);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let error = normalize_batch_error(&error, &job.custom_id(), &job.model);
+                    self.db.mark_failed(&job.id, "failed", &error).await?;
+                    self.notifier(&job.id).await.notify_waiters();
+                    return Ok(true);
                 }
                 let response = match self.read_batch_result(job, auth, batch).await {
                     Ok(response) => response,

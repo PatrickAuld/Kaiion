@@ -21,8 +21,21 @@ jobs:
       - id: fmt
         run: cargo fmt --all -- --check
         continue-on-error: true
+      # Format the ephemeral checkout so compiler/test diagnostics are not
+      # hidden by a formatting-only failure. The final gate still fails CI.
+      - run: cargo fmt --all
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets --all-features -- --test-threads=1
+      - if: always()
+        run: cargo test --all-targets --all-features -- --test-threads=1
+      - name: Preserve rustfmt output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formatted-source-${{ github.sha }}
+          path: |
+            src
+            tests
+          if-no-files-found: error
       - name: Preserve resolved dependency lockfile
         if: always()
         uses: actions/upload-artifact@v4
