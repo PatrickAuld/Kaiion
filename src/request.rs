@@ -32,14 +32,15 @@ impl UpstreamAuth {
 
     pub fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(self.authorization.as_bytes());
+        // Delimit and label each component. Without field labels, an
+        // organization value and a project value with the same bytes would
+        // share a durable job namespace.
+        hash_component(&mut hasher, b"authorization", &self.authorization);
         if let Some(organization) = &self.organization {
-            hasher.update([0]);
-            hasher.update(organization.as_bytes());
+            hash_component(&mut hasher, b"organization", organization);
         }
         if let Some(project) = &self.project {
-            hasher.update([0]);
-            hasher.update(project.as_bytes());
+            hash_component(&mut hasher, b"project", project);
         }
         hex_digest(hasher.finalize())
     }
@@ -55,7 +56,7 @@ pub struct NormalizedRequest {
 }
 
 impl NormalizedRequest {
-    pub fn from_body(body: &Value) -> Result<Self, ProxyError> {
+    pub fn from_body(body: &Value, provider_namespace: &str) -> Result<Self, ProxyError> {
         let mut batch_body = body.clone();
         let object = batch_body.as_object_mut().ok_or_else(|| {
             ProxyError::BadRequest("Responses request must be a JSON object".to_string())
@@ -78,7 +79,13 @@ impl NormalizedRequest {
         let mut fingerprint_body = batch_body.clone();
         remove_volatile_codex_metadata(&mut fingerprint_body);
         let encoded = serde_json::to_vec(&fingerprint_body)?;
-        let request_hash = hex_digest(Sha256::digest(encoded));
+        let mut hasher = Sha256::new();
+        // A persisted database can be reused after configuration changes.
+        // Scope durable identities to the configured provider so an identical
+        // request is never replayed from a different upstream deployment.
+        hash_component(&mut hasher, b"provider", provider_namespace);
+        hash_bytes(&mut hasher, b"request", &encoded);
+        let request_hash = hex_digest(hasher.finalize());
 
         Ok(Self {
             batch_body,
@@ -150,6 +157,17 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     value
 }
 
+fn hash_component(hasher: &mut Sha256, name: &[u8], value: &str) {
+    hash_bytes(hasher, name, value.as_bytes());
+}
+
+fn hash_bytes(hasher: &mut Sha256, name: &[u8], value: &[u8]) {
+    hasher.update((name.len() as u64).to_be_bytes());
+    hasher.update(name);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -181,8 +199,8 @@ mod tests {
                 "x-codex-turn-metadata": "volatile-2"
             }
         });
-        let first = NormalizedRequest::from_body(&first).unwrap();
-        let second = NormalizedRequest::from_body(&second).unwrap();
+        let first = NormalizedRequest::from_body(&first, "provider-a").unwrap();
+        let second = NormalizedRequest::from_body(&second, "provider-a").unwrap();
         assert_eq!(first.request_hash, second.request_hash);
         assert_eq!(first.session_key, second.session_key);
         assert_eq!(first.batch_body["stream"], false);
@@ -202,9 +220,29 @@ mod tests {
             "client_metadata": {"thread_id": "thread", "turn_id": "turn-2"}
         });
         assert_ne!(
-            NormalizedRequest::from_body(&first).unwrap().request_hash,
-            NormalizedRequest::from_body(&second).unwrap().request_hash
+            NormalizedRequest::from_body(&first, "provider-a")
+                .unwrap()
+                .request_hash,
+            NormalizedRequest::from_body(&second, "provider-a")
+                .unwrap()
+                .request_hash
+        );
+    }
+
+    #[test]
+    fn scopes_request_identity_to_the_provider() {
+        let body = json!({
+            "model": "gpt-test",
+            "input": [],
+            "client_metadata": {"thread_id": "thread", "turn_id": "turn"}
+        });
+        assert_ne!(
+            NormalizedRequest::from_body(&body, "provider-a")
+                .unwrap()
+                .request_hash,
+            NormalizedRequest::from_body(&body, "provider-b")
+                .unwrap()
+                .request_hash
         );
     }
 }
-

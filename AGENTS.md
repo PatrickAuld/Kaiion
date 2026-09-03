@@ -7,10 +7,17 @@ Before completing a change, run:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo test --all-targets --all-features -- --test-threads=1
 ```
 
 Changes to request identity, persistence, Batch transitions, or SSE framing require black-box coverage. Restart tests must launch Kaiion as a separate process and reuse the same SQLite database.
 
+Run black-box process tests serially so each test's fake provider, Kaiion process, and SQLite lifecycle remain deterministic:
+
+```bash
+cargo test --test black_box -- --test-threads=1
+```
+
 Never persist API keys or raw authorization headers. Preserve direct-mode passthrough behavior. Do not introduce request pooling or an automatic routing mode without an explicit scope change.
 
+Batch-mode request identity must remain scoped to the configured upstream provider and a stable Codex session/thread identifier. The MVP assumes one Kaiion process owns a SQLite database.

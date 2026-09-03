@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use sqlx::{
     FromRow, SqlitePool,
@@ -47,9 +47,14 @@ impl Job {
 
 impl Database {
     pub async fn connect(database_url: &str) -> Result<Self, ProxyError> {
-        let mut options = SqliteConnectOptions::from_str(database_url)?
+        let mut options = SqliteConnectOptions::from_str(database_url)
+            .map_err(|error| ProxyError::Internal(format!("invalid SQLite database URL: {error}")))?
             .create_if_missing(true)
-            .foreign_keys(true);
+            .foreign_keys(true)
+            // Several clients may replay the same turn after a restart. Give
+            // SQLite a chance to serialize those short writes instead of
+            // failing them immediately with "database is locked".
+            .busy_timeout(Duration::from_secs(5));
         let max_connections = if database_url.contains(":memory:") {
             1
         } else {
@@ -72,31 +77,6 @@ impl Database {
         session_key: Option<&str>,
         model: &str,
     ) -> Result<Job, ProxyError> {
-        if let Some(job) = self.find(auth_hash, request_hash).await? {
-            if matches!(job.status.as_str(), "failed" | "expired" | "cancelled") {
-                sqlx::query(
-                    r#"
-                    UPDATE jobs
-                    SET status = 'queued',
-                        attempt = attempt + 1,
-                        input_file_id = NULL,
-                        batch_id = NULL,
-                        output_file_id = NULL,
-                        result_json = NULL,
-                        error_json = NULL,
-                        delivered_at = NULL,
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    WHERE id = ?
-                    "#,
-                )
-                .bind(&job.id)
-                .execute(&self.pool)
-                .await?;
-                return self.get(&job.id).await;
-            }
-            return Ok(job);
-        }
-
         let id = Uuid::new_v4().simple().to_string();
         sqlx::query(
             r#"
@@ -113,9 +93,15 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        self.find(auth_hash, request_hash)
+        let job = self
+            .find(auth_hash, request_hash)
             .await?
-            .ok_or_else(|| ProxyError::Internal("failed to create job".to_string()))
+            .ok_or_else(|| ProxyError::Internal("failed to create job".to_string()))?;
+
+        // Terminal jobs are durable records. A Codex restart requesting the
+        // same turn must replay its completed or failed result, never submit
+        // a second paid Batch implicitly.
+        Ok(job)
     }
 
     pub async fn get(&self, id: &str) -> Result<Job, ProxyError> {
@@ -175,20 +161,40 @@ impl Database {
         &self,
         id: &str,
         input_file_id: &str,
-    ) -> Result<(), ProxyError> {
-        sqlx::query(
+    ) -> Result<bool, ProxyError> {
+        let result = sqlx::query(
             r#"
             UPDATE jobs
             SET status = 'file_uploaded', input_file_id = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?
+            WHERE id = ? AND status = 'queued'
             "#,
         )
         .bind(input_file_id)
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Persist the intent to create a Batch before issuing the upstream
+    /// request. If the process dies after the request leaves the socket, a
+    /// replay can discover the batch by metadata instead of blindly creating
+    /// another one.
+    pub async fn mark_submitting(&self, id: &str, attempt: i64) -> Result<bool, ProxyError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = 'submitting',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE id = ? AND attempt = ? AND status = 'file_uploaded'
+            "#,
+        )
+        .bind(id)
+        .bind(attempt)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn mark_submitted(&self, id: &str, batch_id: &str) -> Result<(), ProxyError> {
@@ -197,7 +203,7 @@ impl Database {
             UPDATE jobs
             SET status = 'submitted', batch_id = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?
+            WHERE id = ? AND status = 'submitting'
             "#,
         )
         .bind(batch_id)
@@ -218,7 +224,7 @@ impl Database {
             UPDATE jobs
             SET status = 'completed', output_file_id = ?, result_json = ?, error_json = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?
+            WHERE id = ? AND status = 'submitted'
             "#,
         )
         .bind(output_file_id)
@@ -245,7 +251,7 @@ impl Database {
             UPDATE jobs
             SET status = ?, error_json = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE id = ?
+            WHERE id = ? AND status IN ('queued', 'file_uploaded', 'submitting', 'submitted')
             "#,
         )
         .bind(status)
@@ -294,7 +300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_failed_requests_as_a_new_attempt() {
+    async fn replays_a_failed_request_without_a_new_attempt() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let first = db
             .get_or_create("auth", "request", Some("session"), "model")
@@ -308,8 +314,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first.id, second.id);
-        assert_eq!(second.attempt, 2);
-        assert_eq!(second.status, "queued");
+        assert_eq!(second.attempt, 1);
+        assert_eq!(second.status, "failed");
     }
 }
-

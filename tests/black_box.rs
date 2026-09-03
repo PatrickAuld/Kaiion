@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    convert::Infallible,
     net::SocketAddr,
     path::Path,
     pin::Pin,
@@ -21,7 +20,7 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt, stream};
+use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
@@ -40,10 +39,21 @@ struct FakeProvider {
 struct FakeProviderInner {
     files: Mutex<HashMap<String, String>>,
     batches: Mutex<HashMap<String, FakeBatch>>,
-    authorizations: Mutex<Vec<String>>,
+    calls: Mutex<Vec<ProviderCall>>,
+    direct_requests: Mutex<Vec<Value>>,
+    uploaded_batch_lines: Mutex<Vec<Value>>,
+    batch_requests: Mutex<Vec<Value>>,
     next_file: AtomicUsize,
     next_batch: AtomicUsize,
     batch_creations: AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderCall {
+    path: &'static str,
+    authorization: String,
+    organization: Option<String>,
+    project: Option<String>,
 }
 
 #[derive(Clone)]
@@ -54,6 +64,13 @@ struct FakeBatch {
     output_file_id: String,
     metadata: Value,
 }
+
+const DIRECT_SSE: &str = concat!(
+    "event: response.created\n",
+    "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_direct\",\"status\":\"in_progress\"}}\n\n",
+    "event: response.completed\n",
+    "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_direct\",\"status\":\"completed\"}}\n\n"
+);
 
 impl FakeProvider {
     fn router(self) -> Router {
@@ -66,13 +83,20 @@ impl FakeProvider {
             .with_state(self)
     }
 
-    async fn record_auth(&self, headers: &HeaderMap) {
-        let value = headers
+    async fn record_call(&self, path: &'static str, headers: &HeaderMap) {
+        let authorization = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        self.inner.authorizations.lock().await.push(value);
+        let organization = header_value(headers, "openai-organization");
+        let project = header_value(headers, "openai-project");
+        self.inner.calls.lock().await.push(ProviderCall {
+            path,
+            authorization,
+            organization,
+            project,
+        });
     }
 
     async fn complete_all(&self) {
@@ -84,6 +108,17 @@ impl FakeProvider {
     fn batch_creations(&self) -> usize {
         self.inner.batch_creations.load(Ordering::SeqCst)
     }
+
+    async fn calls(&self) -> Vec<ProviderCall> {
+        self.inner.calls.lock().await.clone()
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 async fn fake_direct_response(
@@ -91,12 +126,18 @@ async fn fake_direct_response(
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Response {
-    provider.record_auth(&headers).await;
-    let model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("gpt-test");
-    sse_response(model, "direct response")
+    provider.record_call("responses", &headers).await;
+    provider.inner.direct_requests.lock().await.push(request.clone());
+    let mut response = Response::new(Body::from(DIRECT_SSE));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        "x-provider-trace",
+        HeaderValue::from_static("direct-sentinel"),
+    );
+    response
 }
 
 async fn fake_upload_file(
@@ -104,7 +145,7 @@ async fn fake_upload_file(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    provider.record_auth(&headers).await;
+    provider.record_call("files", &headers).await;
     let mut content = None;
     while let Some(field) = multipart
         .next_field()
@@ -116,6 +157,23 @@ async fn fake_upload_file(
         }
     }
     let content = content.ok_or((StatusCode::BAD_REQUEST, "missing file".to_string()))?;
+    let lines = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).map_err(internal_test_error))
+        .collect::<Result<Vec<Value>, _>>()?;
+    if lines.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "batch input is empty".to_string(),
+        ));
+    }
+    provider
+        .inner
+        .uploaded_batch_lines
+        .lock()
+        .await
+        .extend(lines);
     let number = provider.inner.next_file.fetch_add(1, Ordering::SeqCst);
     let id = format!("file-input-{number}");
     provider
@@ -132,7 +190,8 @@ async fn fake_create_batch(
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    provider.record_auth(&headers).await;
+    provider.record_call("batches", &headers).await;
+    provider.inner.batch_requests.lock().await.push(request.clone());
     let input_file_id = request["input_file_id"]
         .as_str()
         .ok_or((StatusCode::BAD_REQUEST, "missing input_file_id".to_string()))?
@@ -201,7 +260,7 @@ async fn fake_list_batches(
     State(provider): State<FakeProvider>,
     headers: HeaderMap,
 ) -> Json<Value> {
-    provider.record_auth(&headers).await;
+    provider.record_call("batches:list", &headers).await;
     let batches = provider
         .inner
         .batches
@@ -218,7 +277,7 @@ async fn fake_get_batch(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    provider.record_auth(&headers).await;
+    provider.record_call("batches:get", &headers).await;
     provider
         .inner
         .batches
@@ -234,7 +293,7 @@ async fn fake_file_content(
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, StatusCode> {
-    provider.record_auth(&headers).await;
+    provider.record_call("files:content", &headers).await;
     let content = provider
         .inner
         .files
@@ -290,20 +349,6 @@ fn complete_response(model: &str, text: &str) -> Value {
             "total_tokens": 12
         }
     })
-}
-
-fn sse_response(model: &str, text: &str) -> Response {
-    let response = complete_response(model, text);
-    let events = kaiion::sse::completed_events(&response).unwrap();
-    let body = Body::from_stream(stream::iter(
-        events.into_iter().map(Ok::<Bytes, Infallible>),
-    ));
-    let mut response = Response::new(body);
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream"),
-    );
-    response
 }
 
 fn internal_test_error(error: impl std::fmt::Display) -> (StatusCode, String) {
@@ -447,14 +492,27 @@ impl FakeCodex {
     }
 
     async fn send(&self, request: &Value) -> CodexStream {
-        let response = self
+        self.send_with_headers(request, "test-key", None, None).await
+    }
+
+    async fn send_with_headers(
+        &self,
+        request: &Value,
+        api_key: &str,
+        organization: Option<&str>,
+        project: Option<&str>,
+    ) -> CodexStream {
+        let mut outbound = self
             .client
             .post(format!("http://{}/v1/responses", self.address))
-            .bearer_auth("test-key")
-            .json(request)
-            .send()
-            .await
-            .unwrap();
+            .bearer_auth(api_key);
+        if let Some(organization) = organization {
+            outbound = outbound.header("openai-organization", organization);
+        }
+        if let Some(project) = project {
+            outbound = outbound.header("openai-project", project);
+        }
+        let response = outbound.json(request).send().await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
         CodexStream {
@@ -467,6 +525,14 @@ impl FakeCodex {
 }
 
 impl CodexStream {
+    async fn all_bytes(mut self) -> Vec<u8> {
+        let mut bytes = std::mem::take(&mut self.buffer);
+        while let Some(next) = self.bytes.next().await {
+            bytes.extend_from_slice(&next.expect("SSE transport failed"));
+        }
+        bytes
+    }
+
     async fn next_event(&mut self) -> Option<SseEvent> {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -524,13 +590,59 @@ fn events_contain(events: &[SseEvent], needle: &str) -> bool {
 }
 
 async fn wait_for_batch(provider: &FakeProvider) {
-    for _ in 0..100 {
-        if provider.batch_creations() > 0 {
+    wait_for_batch_count(provider, 1).await;
+}
+
+async fn wait_for_batch_count(provider: &FakeProvider, expected: usize) {
+    for _ in 0..400 {
+        if provider.batch_creations() >= expected {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("Kaiion did not create a batch");
+    panic!("Kaiion did not create {expected} batches");
+}
+
+async fn wait_for_provider_call(provider: &FakeProvider, path: &str) {
+    for _ in 0..400 {
+        if provider.calls().await.iter().any(|call| call.path == path) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("Kaiion did not call provider endpoint {path}");
+}
+
+async fn assert_all_calls_use_credentials(
+    provider: &FakeProvider,
+    api_key: &str,
+    organization: Option<&str>,
+    project: Option<&str>,
+) {
+    let calls = provider.calls().await;
+    assert!(!calls.is_empty(), "expected at least one provider call");
+    for call in calls {
+        assert_eq!(call.authorization, format!("Bearer {api_key}"), "{call:?}");
+        assert_eq!(call.organization.as_deref(), organization, "{call:?}");
+        assert_eq!(call.project.as_deref(), project, "{call:?}");
+    }
+}
+
+async fn expect_batch_lifecycle_start(stream: &mut CodexStream) -> String {
+    let created = stream.next_event().await.unwrap();
+    assert_eq!(created.kind, "response.created");
+    assert_eq!(created.data["sequence_number"], 0);
+    assert_eq!(created.data["response"]["status"], "in_progress");
+    let response_id = created.data["response"]["id"].as_str().unwrap().to_string();
+
+    let progress = stream.next_event().await.unwrap();
+    assert_eq!(progress.kind, "response.in_progress");
+    assert_eq!(progress.data["sequence_number"], 1);
+    assert_eq!(
+        progress.data["response"]["id"].as_str(),
+        Some(response_id.as_str())
+    );
+    response_id
 }
 
 #[tokio::test]
@@ -541,17 +653,48 @@ async fn direct_mode_passes_through_sse_and_authorization() {
     let kaiion = start_kaiion("direct", &directory.path().join("kaiion.db"), fake.address).await;
     let codex = FakeCodex::new(kaiion.address);
 
-    let mut response = codex.send(&codex_request("window-1")).await;
+    let request = codex_request("window-1");
+    let response = codex
+        .send_with_headers(
+            &request,
+            "direct-key",
+            Some("org-direct"),
+            Some("project-direct"),
+        )
+        .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.headers["x-kaiion-mode"], "direct");
-    let events = response.through_terminal().await;
-    assert!(events_contain(&events, "direct response"));
-    assert_eq!(events.last().unwrap().kind, "response.completed");
+    assert_eq!(response.headers["x-provider-trace"], "direct-sentinel");
+    assert_eq!(response.headers[header::CONTENT_TYPE], "text/event-stream");
+    assert_eq!(response.all_bytes().await, DIRECT_SSE.as_bytes());
     assert_eq!(provider.batch_creations(), 0);
-    assert_eq!(
-        provider.inner.authorizations.lock().await.clone(),
-        vec!["Bearer test-key".to_string()]
-    );
+    assert_eq!(provider.inner.direct_requests.lock().await.as_slice(), &[request]);
+    assert_all_calls_use_credentials(
+        &provider,
+        "direct-key",
+        Some("org-direct"),
+        Some("project-direct"),
+    )
+    .await;
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn batch_mode_rejects_requests_without_restart_safe_session_identity() {
+    let provider = FakeProvider::default();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let mut request = codex_request("window-1");
+    request.as_object_mut().unwrap().remove("client_metadata");
+
+    let response = codex.send(&request).await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    let body = String::from_utf8(response.all_bytes().await).unwrap();
+    assert!(body.contains("client_metadata.thread_id"));
+    assert!(provider.calls().await.is_empty());
+    kaiion.stop().await;
 }
 
 #[tokio::test]
@@ -562,11 +705,26 @@ async fn batch_mode_emits_progress_and_translates_the_result_to_sse() {
     let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
     let codex = FakeCodex::new(kaiion.address);
 
-    let mut response = codex.send(&codex_request("window-1")).await;
+    let request = codex_request("window-1");
+    let mut response = codex
+        .send_with_headers(
+            &request,
+            "batch-key",
+            Some("org-batch"),
+            Some("project-batch"),
+        )
+        .await;
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(response.headers["x-kaiion-mode"], "batch");
-    assert_eq!(response.next_event().await.unwrap().kind, "response.in_progress");
+    let response_id = expect_batch_lifecycle_start(&mut response).await;
     wait_for_batch(&provider).await;
+    let second_progress = response.next_event().await.unwrap();
+    assert_eq!(second_progress.kind, "response.in_progress");
+    assert_eq!(second_progress.data["sequence_number"], 2);
+    assert_eq!(
+        second_progress.data["response"]["id"].as_str(),
+        Some(response_id.as_str())
+    );
     provider.complete_all().await;
 
     let events = response.through_terminal().await;
@@ -575,7 +733,135 @@ async fn batch_mode_emits_progress_and_translates_the_result_to_sse() {
         .iter()
         .any(|event| event.kind == "response.output_item.done"));
     assert_eq!(events.last().unwrap().kind, "response.completed");
+    let terminal_events = events
+        .iter()
+        .filter(|event| event.kind != "response.in_progress")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["response.output_item.done", "response.completed"]
+    );
+    assert_eq!(terminal_events[0].data["sequence_number"], 3);
+    assert_eq!(terminal_events[1].data["sequence_number"], 4);
+    assert_eq!(
+        terminal_events[1].data["response"]["id"].as_str(),
+        Some(response_id.as_str())
+    );
     assert_eq!(provider.batch_creations(), 1);
+    let uploaded = provider.inner.uploaded_batch_lines.lock().await;
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(uploaded[0]["method"], "POST");
+    assert_eq!(uploaded[0]["url"], "/v1/responses");
+    assert_eq!(uploaded[0]["body"]["stream"], false);
+    assert!(uploaded[0]["body"].get("stream_options").is_none());
+    assert_eq!(uploaded[0]["body"]["input"], request["input"]);
+    drop(uploaded);
+    let batches = provider.inner.batch_requests.lock().await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0]["endpoint"], "/v1/responses");
+    assert_eq!(batches[0]["completion_window"], "24h");
+    assert!(batches[0]["metadata"]["kaiion_job_id"].is_string());
+    drop(batches);
+    assert_all_calls_use_credentials(
+        &provider,
+        "batch-key",
+        Some("org-batch"),
+        Some("project-batch"),
+    )
+    .await;
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn client_disconnect_does_not_cancel_the_batch_or_create_a_duplicate() {
+    let provider = FakeProvider::default();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+
+    let mut first = codex.send(&codex_request("window-first")).await;
+    assert_eq!(first.status, StatusCode::OK);
+    let job_id = first.headers["x-kaiion-job-id"].to_str().unwrap().to_string();
+    assert!(expect_batch_lifecycle_start(&mut first).await.starts_with("resp_kaiion_"));
+    drop(first);
+    wait_for_batch(&provider).await;
+
+    // A reconnect with only volatile Codex fields changed must find the same durable job.
+    let mut duplicate = codex.send(&codex_request("window-second")).await;
+    assert_eq!(
+        duplicate.headers["x-kaiion-job-id"].to_str().unwrap(),
+        job_id
+    );
+    assert!(expect_batch_lifecycle_start(&mut duplicate)
+        .await
+        .starts_with("resp_kaiion_"));
+    assert_eq!(provider.batch_creations(), 1);
+    drop(duplicate);
+
+    // Completion is driven by Kaiion's poller, not a still-open Codex TCP stream.
+    provider.complete_all().await;
+    wait_for_provider_call(&provider, "files:content").await;
+
+    let mut replay = codex.send(&codex_request("window-third")).await;
+    assert_eq!(replay.headers["x-kaiion-job-id"].to_str().unwrap(), job_id);
+    let events = replay.through_terminal().await;
+    assert!(events_contain(&events, "batch response"));
+    assert_eq!(events.last().unwrap().kind, "response.completed");
+    assert_eq!(provider.batch_creations(), 1);
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn identical_requests_with_different_api_keys_are_not_deduplicated() {
+    let provider = FakeProvider::default();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let request = codex_request("window-isolation");
+
+    let mut first = codex
+        .send_with_headers(&request, "tenant-a", None, None)
+        .await;
+    assert!(expect_batch_lifecycle_start(&mut first)
+        .await
+        .starts_with("resp_kaiion_"));
+    wait_for_batch_count(&provider, 1).await;
+
+    let mut second = codex
+        .send_with_headers(&request, "tenant-b", None, None)
+        .await;
+    assert!(expect_batch_lifecycle_start(&mut second)
+        .await
+        .starts_with("resp_kaiion_"));
+    wait_for_batch_count(&provider, 2).await;
+    assert_ne!(
+        first.headers["x-kaiion-job-id"],
+        second.headers["x-kaiion-job-id"]
+    );
+
+    provider.complete_all().await;
+    assert_eq!(first.through_terminal().await.last().unwrap().kind, "response.completed");
+    assert_eq!(
+        second.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
+    let calls = provider.calls().await;
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.authorization == "Bearer tenant-a")
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.authorization == "Bearer tenant-b")
+    );
+    kaiion.stop().await;
 }
 
 #[tokio::test]
@@ -588,10 +874,9 @@ async fn restart_reuses_the_batch_and_replays_its_result() {
     let first_process = start_kaiion("batch", &database, fake.address).await;
     let first_codex = FakeCodex::new(first_process.address);
     let mut first_stream = first_codex.send(&codex_request("window-before")).await;
-    assert_eq!(
-        first_stream.next_event().await.unwrap().kind,
-        "response.in_progress"
-    );
+    assert!(expect_batch_lifecycle_start(&mut first_stream)
+        .await
+        .starts_with("resp_kaiion_"));
     wait_for_batch(&provider).await;
     drop(first_stream);
     first_process.stop().await;
@@ -605,15 +890,9 @@ async fn restart_reuses_the_batch_and_replays_its_result() {
     assert!(events_contain(&events, "batch response"));
     assert_eq!(events.last().unwrap().kind, "response.completed");
     assert_eq!(provider.batch_creations(), 1);
-    assert!(provider
-        .inner
-        .authorizations
-        .lock()
-        .await
-        .iter()
-        .all(|value| value == "Bearer test-key"));
+    assert_all_calls_use_credentials(&provider, "test-key", None, None).await;
 
-    let upstream_calls = provider.inner.authorizations.lock().await.len();
+    let upstream_calls = provider.calls().await.len();
     second_process.stop().await;
     let third_process = start_kaiion("batch", &database, fake.address).await;
     let third_codex = FakeCodex::new(third_process.address);
@@ -623,7 +902,8 @@ async fn restart_reuses_the_batch_and_replays_its_result() {
     assert_eq!(replayed_events.last().unwrap().kind, "response.completed");
     assert_eq!(provider.batch_creations(), 1);
     assert_eq!(
-        provider.inner.authorizations.lock().await.len(),
+        provider.calls().await.len(),
         upstream_calls
     );
+    third_process.stop().await;
 }

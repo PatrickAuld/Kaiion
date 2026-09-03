@@ -8,7 +8,7 @@ Kaiion is a durable OpenAI Responses API proxy that lets Codex use either normal
 - `batch` mode converts the request into a one-entry Batch API job.
 - Batch status is polled and the completed response is converted back into Responses SSE events.
 - `response.in_progress` events keep Codex's stream alive while Batch inference is pending.
-- SQLite stores upstream IDs and completed responses so an identical request can reconnect after either Codex or Kaiion restarts.
+- SQLite stores upstream IDs and terminal responses so a reissued request can reconnect after either Codex or Kaiion restarts.
 - The incoming API key, organization, and project headers are passed through to OpenAI. Credentials are never persisted; only a SHA-256 credential fingerprint is stored for request isolation.
 - No pooling, automatic routing, supervisor, or webhook receiver is included.
 
@@ -57,7 +57,7 @@ codex
 
 ## Restart semantics
 
-Batch requests are identified by the credential fingerprint and a canonical hash of the Responses request. Kaiion removes `stream`, `stream_options`, `x-codex-window-id`, and `x-codex-turn-metadata` from the identity because those fields can change when Codex reconnects. Stable session, thread, turn, prompt, and tool state remain part of the identity.
+Batch requests are identified by the upstream provider URL, credential fingerprint, and a canonical hash of the Responses request. Kaiion removes `stream`, `stream_options`, `x-codex-window-id`, and `x-codex-turn-metadata` from the identity because those fields can change when Codex reconnects. Stable session, thread, turn, prompt, and tool state remain part of the identity. Batch mode rejects requests without `client_metadata.thread_id` or `client_metadata.session_id`; that stable identity is required to make replay safe.
 
 When Codex repeats an unfinished request:
 
@@ -68,12 +68,22 @@ When Codex repeats an unfinished request:
 
 Because API keys are deliberately not stored, Kaiion cannot poll after its own restart until a matching client request supplies the key again. While Kaiion remains running, its in-process poller continues after a client disconnects.
 
+Stock Codex currently records an interrupted in-progress turn when its process exits; it does not automatically resend that unfinished inference merely because `codex resume` starts. Kaiion recovery applies when Codex, a harness, or another client reissues the same request. Transparent automatic continuation would require a small Codex-side resend hook or an external launcher that replays the pending turn.
+
+The MVP supports one Kaiion process per SQLite database. Multiple processes sharing one database require a cross-process polling/submission lease, which is intentionally outside this scope.
+
 There is one inherent ambiguity in a transparent HTTP proxy: an intentionally repeated, byte-equivalent inference in the same turn is indistinguishable from transport replay. Kaiion treats it as replay. A future client-generated idempotency key would remove that ambiguity.
 
 ## Tests
 
 ```bash
-cargo test --all-targets
+cargo test --all-targets -- --test-threads=1
+```
+
+The process-level suite can also be run on its own:
+
+```bash
+cargo test --test black_box -- --test-threads=1
 ```
 
 `tests/black_box.rs` launches:
@@ -82,7 +92,7 @@ cargo test --all-targets
 - Kaiion as a separate OS process.
 - A fake Codex client that sends streaming Responses requests and parses the returned SSE bytes.
 
-The suite verifies direct passthrough, API-key passthrough, Batch conversion, `response.in_progress`, final SSE reconstruction, disconnect behavior, a full Kaiion process restart, SQLite recovery, and prevention of duplicate batch creation.
+The suite verifies direct passthrough, API-key/organization/project passthrough, Batch wire conversion, `response.in_progress`, final SSE reconstruction, Codex disconnect behavior, durable deduplication, a full Kaiion process restart, SQLite recovery, and stored-result replay without further upstream calls.
 
 ## API surface
 
@@ -91,4 +101,3 @@ The suite verifies direct passthrough, API-key passthrough, Batch conversion, `r
 - `GET /healthz`
 
 Batch mode currently requires `stream: true`, matching Codex's transport behavior.
-

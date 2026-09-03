@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 
 use crate::{error::ProxyError, request::UpstreamAuth};
 
+const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct OpenAiClient {
     http: reqwest::Client,
@@ -30,12 +32,17 @@ struct FileObject {
 #[derive(Debug, Deserialize)]
 struct BatchList {
     data: Vec<BatchObject>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    last_id: Option<String>,
 }
 
 impl OpenAiClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self, ProxyError> {
         let http = reqwest::Client::builder()
             .tcp_keepalive(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(15))
             .build()?;
         Ok(Self {
             http,
@@ -75,6 +82,7 @@ impl OpenAiClient {
         let response = self
             .with_auth(self.http.post(self.url("files")), auth)
             .multipart(form)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .send()
             .await?;
         self.parse_json::<FileObject>(response).await.map(|file| file.id)
@@ -99,6 +107,7 @@ impl OpenAiClient {
         let response = self
             .with_auth(self.http.post(self.url("batches")), auth)
             .json(&body)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .send()
             .await?;
         self.parse_json(response).await
@@ -114,6 +123,7 @@ impl OpenAiClient {
                 self.http.get(self.url(&format!("batches/{batch_id}"))),
                 auth,
             )
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .send()
             .await?;
         self.parse_json(response).await
@@ -125,20 +135,40 @@ impl OpenAiClient {
         job_id: &str,
         attempt: i64,
     ) -> Result<Option<BatchObject>, ProxyError> {
-        let response = self
-            .with_auth(self.http.get(self.url("batches?limit=100")), auth)
-            .send()
-            .await?;
-        let batches: BatchList = self.parse_json(response).await?;
         let attempt = attempt.to_string();
-        Ok(batches.data.into_iter().find(|batch| {
-            let Some(metadata) = batch.metadata.as_ref().and_then(Value::as_object) else {
-                return false;
+        let mut after = None;
+
+        // A restart can happen long after the batch was submitted. Search all
+        // pages, not merely the most recent 100 batches, before creating a
+        // replacement batch for the same durable job attempt.
+        loop {
+            let mut request = self
+                .with_auth(self.http.get(self.url("batches")), auth)
+                .query(&[("limit", "100")]);
+            if let Some(last_id) = &after {
+                request = request.query(&[("after", last_id)]);
+            }
+            let response = request.timeout(CONTROL_REQUEST_TIMEOUT).send().await?;
+            let batches: BatchList = self.parse_json(response).await?;
+            if let Some(batch) = batches.data.into_iter().find(|batch| {
+                let Some(metadata) = batch.metadata.as_ref().and_then(Value::as_object) else {
+                    return false;
+                };
+                metadata.get("kaiion_job_id").and_then(Value::as_str) == Some(job_id)
+                    && metadata.get("kaiion_attempt").and_then(Value::as_str)
+                        == Some(attempt.as_str())
+            }) {
+                return Ok(Some(batch));
+            }
+
+            let Some(last_id) = batches.last_id.filter(|id| !id.is_empty()) else {
+                return Ok(None);
             };
-            metadata.get("kaiion_job_id").and_then(Value::as_str) == Some(job_id)
-                && metadata.get("kaiion_attempt").and_then(Value::as_str)
-                    == Some(attempt.as_str())
-        }))
+            if !batches.has_more || after.as_deref() == Some(last_id.as_str()) {
+                return Ok(None);
+            }
+            after = Some(last_id);
+        }
     }
 
     pub async fn get_file_content(
@@ -152,6 +182,7 @@ impl OpenAiClient {
                     .get(self.url(&format!("files/{file_id}/content"))),
                 auth,
             )
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .send()
             .await?;
         self.parse_text(response).await

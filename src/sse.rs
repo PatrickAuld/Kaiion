@@ -3,49 +3,68 @@ use serde_json::{Value, json};
 
 use crate::error::ProxyError;
 
-pub fn in_progress_event(job_id: &str, model: &str) -> Bytes {
+pub fn created_event(response_id: &str, model: &str, sequence_number: u64) -> Bytes {
     event(
-        "response.in_progress",
+        "response.created",
         &json!({
-            "type": "response.in_progress",
-            "sequence_number": 0,
-            "response": {
-                "id": format!("resp_kaiion_{job_id}"),
-                "object": "response",
-                "created_at": 0,
-                "status": "in_progress",
-                "model": model,
-                "output": []
-            }
+            "type": "response.created",
+            "sequence_number": sequence_number,
+            "response": response_stub(response_id, model, "in_progress")
         }),
     )
 }
 
+pub fn in_progress_event(response_id: &str, model: &str, sequence_number: u64) -> Bytes {
+    event(
+        "response.in_progress",
+        &json!({
+            "type": "response.in_progress",
+            "sequence_number": sequence_number,
+            "response": response_stub(response_id, model, "in_progress")
+        }),
+    )
+}
+
+/// Converts a completed Responses object to a complete standalone event
+/// sequence. This is retained for callers that already have no interim
+/// lifecycle events to send.
 pub fn completed_events(response: &Value) -> Result<Vec<Bytes>, ProxyError> {
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProxyError::Internal("batch response is missing id".to_string()))?;
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ProxyError::Internal("batch response is missing model".to_string()))?;
+    let mut events = vec![created_event(response_id, model, 0), in_progress_event(response_id, model, 1)];
+    events.extend(completion_events(response, response_id, 2)?);
+    Ok(events)
+}
+
+/// Emits only the terminal portion of a lifecycle whose `created` and
+/// `in_progress` events were already sent. The proxy owns the response ID in
+/// batch mode, so every event in a connection uses one stable ID.
+pub fn completion_events(
+    response: &Value,
+    response_id: &str,
+    first_sequence_number: u64,
+) -> Result<Vec<Bytes>, ProxyError> {
     let output = response
         .get("output")
         .and_then(Value::as_array)
         .ok_or_else(|| ProxyError::Internal("batch response is missing output".to_string()))?;
 
-    let mut created_response = response.clone();
-    if let Some(object) = created_response.as_object_mut() {
-        object.insert("status".to_string(), Value::String("in_progress".to_string()));
-        object.insert("output".to_string(), Value::Array(Vec::new()));
-        object.remove("usage");
-    }
+    let mut completed_response = response.clone();
+    let object = completed_response.as_object_mut().ok_or_else(|| {
+        ProxyError::Internal("batch response is not a JSON object".to_string())
+    })?;
+    object.insert("id".to_string(), Value::String(response_id.to_string()));
 
-    let mut sequence = 0_u64;
-    let mut events = vec![event(
-        "response.created",
-        &json!({
-            "type": "response.created",
-            "sequence_number": sequence,
-            "response": created_response
-        }),
-    )];
+    let mut sequence = first_sequence_number;
+    let mut events = Vec::with_capacity(output.len() + 1);
 
     for (output_index, item) in output.iter().enumerate() {
-        sequence += 1;
         events.push(event(
             "response.output_item.done",
             &json!({
@@ -55,28 +74,28 @@ pub fn completed_events(response: &Value) -> Result<Vec<Bytes>, ProxyError> {
                 "item": item
             }),
         ));
+        sequence += 1;
     }
 
-    sequence += 1;
     events.push(event(
         "response.completed",
         &json!({
             "type": "response.completed",
             "sequence_number": sequence,
-            "response": response
+            "response": completed_response
         }),
     ));
     Ok(events)
 }
 
-pub fn failed_event(job_id: &str, model: &str, message: &str) -> Bytes {
+pub fn failed_event(response_id: &str, model: &str, sequence_number: u64, message: &str) -> Bytes {
     event(
         "response.failed",
         &json!({
             "type": "response.failed",
-            "sequence_number": 0,
+            "sequence_number": sequence_number,
             "response": {
-                "id": format!("resp_kaiion_{job_id}"),
+                "id": response_id,
                 "object": "response",
                 "created_at": 0,
                 "status": "failed",
@@ -90,6 +109,59 @@ pub fn failed_event(job_id: &str, model: &str, message: &str) -> Bytes {
             }
         }),
     )
+}
+
+/// Preserves an upstream terminal Responses object when Batch output contains
+/// one, including the distinction between `failed` and `incomplete`.
+pub fn terminal_error_event(
+    response_id: &str,
+    model: &str,
+    sequence_number: u64,
+    error_json: &str,
+) -> Bytes {
+    let Ok(mut response) = serde_json::from_str::<Value>(error_json) else {
+        return failed_event(response_id, model, sequence_number, error_json);
+    };
+    let Some(object) = response.as_object_mut() else {
+        return failed_event(response_id, model, sequence_number, error_json);
+    };
+    let Some(status) = object.get("status").and_then(Value::as_str) else {
+        return failed_event(response_id, model, sequence_number, error_json);
+    };
+    let kind = match status {
+        "failed" => "response.failed",
+        "incomplete" => "response.incomplete",
+        _ => return failed_event(response_id, model, sequence_number, error_json),
+    };
+    object.insert("id".to_string(), Value::String(response_id.to_string()));
+    object
+        .entry("object".to_string())
+        .or_insert_with(|| Value::String("response".to_string()));
+    object
+        .entry("model".to_string())
+        .or_insert_with(|| Value::String(model.to_string()));
+    object
+        .entry("output".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    event(
+        kind,
+        &json!({
+            "type": kind,
+            "sequence_number": sequence_number,
+            "response": response,
+        }),
+    )
+}
+
+fn response_stub(response_id: &str, model: &str, status: &str) -> Value {
+    json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": 0,
+        "status": status,
+        "model": model,
+        "output": []
+    })
 }
 
 fn event(kind: &str, data: &Value) -> Bytes {

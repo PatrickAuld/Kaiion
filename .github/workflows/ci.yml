@@ -16,7 +16,20 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
+      # Keep compiling and running the black-box suite when formatting fails so a
+      # formatting-only regression does not hide more consequential failures.
+      - id: fmt
+        run: cargo fmt --all -- --check
+        continue-on-error: true
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets --all-features
-
+      - run: cargo test --all-targets --all-features -- --test-threads=1
+      - name: Preserve resolved dependency lockfile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock-${{ github.sha }}
+          path: Cargo.lock
+          if-no-files-found: error
+      - name: Require Rust formatting
+        if: always()
+        run: test "${{ steps.fmt.outcome }}" = success
