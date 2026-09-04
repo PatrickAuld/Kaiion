@@ -29,17 +29,15 @@ impl Drop for KaiionProcess {
 pub async fn start_kaiion(mode: &str, database: &Path, upstream: SocketAddr) -> KaiionProcess {
     let address = unused_address();
     let database_url = format!("sqlite://{}?mode=rwc", database.display());
-    let executable = env::var_os("CARGO_BIN_EXE_kaiion")
+    let executable = env::var_os("KAIION_TEST_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::current_exe()
-                .expect("integration test executable path")
-                .parent()
-                .expect("integration test executable directory")
-                .parent()
-                .expect("target directory")
-                .join("kaiion")
-        });
+        .or_else(|| option_env!("CARGO_BIN_EXE_kaiion").map(PathBuf::from))
+        .expect("build kaiion and set KAIION_TEST_BINARY to the executable path");
+    assert!(
+        executable.is_file(),
+        "Kaiion test binary does not exist at {}",
+        executable.display()
+    );
     let child = Command::new(executable)
         .arg("--listen")
         .arg(address.to_string())

@@ -113,7 +113,8 @@ cargo test --all-targets -- --test-threads=1
 The process-level suite can also be run on its own:
 
 ```bash
-cargo test --test black_box -- --test-threads=1
+cargo build --locked --all-features --bins
+KAIION_TEST_BINARY=target/debug/kaiion cargo test --locked --test black_box --all-features -- --test-threads=1
 ```
 
 `tests/black_box.rs` launches:
