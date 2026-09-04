@@ -1,6 +1,5 @@
 use std::{
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -234,8 +233,7 @@ fn write_text(path: &Path, content: String, dry_run: bool) -> Result<(), String>
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(io_error("create configuration directory"))?;
     }
-    crate::atomic_file::write(path, content.as_bytes())
-        .map_err(io_error("write configuration"))
+    crate::atomic_file::write(path, content.as_bytes()).map_err(io_error("write configuration"))
 }
 
 fn io_error(action: &'static str) -> impl FnOnce(io::Error) -> String {

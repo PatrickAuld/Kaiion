@@ -238,7 +238,8 @@ async fn health(listen: SocketAddr) -> bool {
 }
 
 fn write_pid(path: &Path, pid: u32) -> Result<(), String> {
-    write_atomic(path, format!("{pid}\n"))
+    crate::atomic_file::write(path, format!("{pid}\n").as_bytes())
+        .map_err(io_error("write PID file"))
 }
 
 fn read_pid(path: &Path) -> Result<Option<u32>, String> {
