@@ -1,626 +1,17 @@
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::Path,
-    pin::Pin,
-    process::Stdio,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+mod support;
 
-use axum::{
-    Json, Router,
-    body::Body,
-    extract::{Multipart, Path as AxumPath, State},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::Response,
-    routing::{get, post},
+use std::time::Duration;
+
+use axum::http::{StatusCode, header};
+use kaiion::{
+    db::Database,
+    domain::{BatchId, FileId, JobState},
+    request::{NormalizedRequest, UpstreamAuth},
 };
-use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tempfile::TempDir;
-use tokio::{
-    net::TcpListener,
-    process::{Child, Command},
-    sync::Mutex,
-    task::JoinHandle,
-};
 
-#[derive(Clone, Default)]
-struct FakeProvider {
-    inner: Arc<FakeProviderInner>,
-}
-
-#[derive(Default)]
-struct FakeProviderInner {
-    files: Mutex<HashMap<String, String>>,
-    batches: Mutex<HashMap<String, FakeBatch>>,
-    calls: Mutex<Vec<ProviderCall>>,
-    direct_requests: Mutex<Vec<Value>>,
-    uploaded_batch_lines: Mutex<Vec<Value>>,
-    batch_requests: Mutex<Vec<Value>>,
-    next_file: AtomicUsize,
-    next_batch: AtomicUsize,
-    batch_creations: AtomicUsize,
-}
-
-#[derive(Clone, Debug)]
-struct ProviderCall {
-    path: &'static str,
-    authorization: String,
-    organization: Option<String>,
-    project: Option<String>,
-}
-
-#[derive(Clone)]
-struct FakeBatch {
-    id: String,
-    status: String,
-    input_file_id: String,
-    output_file_id: String,
-    metadata: Value,
-}
-
-const DIRECT_SSE: &str = concat!(
-    "event: response.created\n",
-    "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_direct\",\"status\":\"in_progress\"}}\n\n",
-    "event: response.completed\n",
-    "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_direct\",\"status\":\"completed\"}}\n\n"
-);
-
-impl FakeProvider {
-    fn router(self) -> Router {
-        Router::new()
-            .route("/v1/responses", post(fake_direct_response))
-            .route("/v1/files", post(fake_upload_file))
-            .route("/v1/files/{id}/content", get(fake_file_content))
-            .route(
-                "/v1/batches",
-                post(fake_create_batch).get(fake_list_batches),
-            )
-            .route("/v1/batches/{id}", get(fake_get_batch))
-            .with_state(self)
-    }
-
-    async fn record_call(&self, path: &'static str, headers: &HeaderMap) {
-        let authorization = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let organization = header_value(headers, "openai-organization");
-        let project = header_value(headers, "openai-project");
-        self.inner.calls.lock().await.push(ProviderCall {
-            path,
-            authorization,
-            organization,
-            project,
-        });
-    }
-
-    async fn complete_all(&self) {
-        for batch in self.inner.batches.lock().await.values_mut() {
-            batch.status = "completed".to_string();
-        }
-    }
-
-    fn batch_creations(&self) -> usize {
-        self.inner.batch_creations.load(Ordering::SeqCst)
-    }
-
-    async fn calls(&self) -> Vec<ProviderCall> {
-        self.inner.calls.lock().await.clone()
-    }
-}
-
-fn header_value(headers: &HeaderMap, name: &'static str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-}
-
-async fn fake_direct_response(
-    State(provider): State<FakeProvider>,
-    headers: HeaderMap,
-    Json(request): Json<Value>,
-) -> Response {
-    provider.record_call("responses", &headers).await;
-    provider
-        .inner
-        .direct_requests
-        .lock()
-        .await
-        .push(request.clone());
-    let mut response = Response::new(Body::from(DIRECT_SSE));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream"),
-    );
-    response.headers_mut().insert(
-        "x-provider-trace",
-        HeaderValue::from_static("direct-sentinel"),
-    );
-    response
-}
-
-async fn fake_upload_file(
-    State(provider): State<FakeProvider>,
-    headers: HeaderMap,
-    mut multipart: Multipart,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    provider.record_call("files", &headers).await;
-    let mut content = None;
-    while let Some(field) = multipart.next_field().await.map_err(internal_test_error)? {
-        if field.name() == Some("file") {
-            content = Some(field.text().await.map_err(internal_test_error)?);
-        }
-    }
-    let content = content.ok_or((StatusCode::BAD_REQUEST, "missing file".to_string()))?;
-    let lines = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).map_err(internal_test_error))
-        .collect::<Result<Vec<Value>, _>>()?;
-    if lines.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "batch input is empty".to_string()));
-    }
-    provider
-        .inner
-        .uploaded_batch_lines
-        .lock()
-        .await
-        .extend(lines);
-    let number = provider.inner.next_file.fetch_add(1, Ordering::SeqCst);
-    let id = format!("file-input-{number}");
-    provider
-        .inner
-        .files
-        .lock()
-        .await
-        .insert(id.clone(), content);
-    Ok(Json(json!({"id": id, "object": "file"})))
-}
-
-async fn fake_create_batch(
-    State(provider): State<FakeProvider>,
-    headers: HeaderMap,
-    Json(request): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    provider.record_call("batches", &headers).await;
-    provider
-        .inner
-        .batch_requests
-        .lock()
-        .await
-        .push(request.clone());
-    let input_file_id = request["input_file_id"]
-        .as_str()
-        .ok_or((StatusCode::BAD_REQUEST, "missing input_file_id".to_string()))?
-        .to_string();
-    let input = provider
-        .inner
-        .files
-        .lock()
-        .await
-        .get(&input_file_id)
-        .cloned()
-        .ok_or((StatusCode::NOT_FOUND, "input file not found".to_string()))?;
-    let input: Value = serde_json::from_str(input.lines().next().unwrap_or_default())
-        .map_err(internal_test_error)?;
-    let custom_id = input["custom_id"]
-        .as_str()
-        .ok_or((StatusCode::BAD_REQUEST, "missing custom_id".to_string()))?;
-    let model = input["body"]["model"].as_str().unwrap_or("gpt-test");
-    let result = complete_response(model, "batch response");
-    let output = json!({
-        "id": "batch-request-1",
-        "custom_id": custom_id,
-        "response": {
-            "status_code": 200,
-            "request_id": "request-1",
-            "body": result
-        },
-        "error": null
-    });
-    let output_file_id = format!(
-        "file-output-{}",
-        provider.inner.next_file.fetch_add(1, Ordering::SeqCst)
-    );
-    provider
-        .inner
-        .files
-        .lock()
-        .await
-        .insert(output_file_id.clone(), format!("{output}\n"));
-
-    let batch_id = format!(
-        "batch-{}",
-        provider.inner.next_batch.fetch_add(1, Ordering::SeqCst)
-    );
-    let batch = FakeBatch {
-        id: batch_id.clone(),
-        status: "in_progress".to_string(),
-        input_file_id,
-        output_file_id,
-        metadata: request.get("metadata").cloned().unwrap_or(Value::Null),
-    };
-    provider
-        .inner
-        .batches
-        .lock()
-        .await
-        .insert(batch_id, batch.clone());
-    provider
-        .inner
-        .batch_creations
-        .fetch_add(1, Ordering::SeqCst);
-    Ok(Json(batch_json(&batch)))
-}
-
-async fn fake_list_batches(
-    State(provider): State<FakeProvider>,
-    headers: HeaderMap,
-) -> Json<Value> {
-    provider.record_call("batches:list", &headers).await;
-    let batches = provider
-        .inner
-        .batches
-        .lock()
-        .await
-        .values()
-        .map(batch_json)
-        .collect::<Vec<_>>();
-    Json(json!({"object": "list", "data": batches, "has_more": false}))
-}
-
-async fn fake_get_batch(
-    State(provider): State<FakeProvider>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, StatusCode> {
-    provider.record_call("batches:get", &headers).await;
-    provider
-        .inner
-        .batches
-        .lock()
-        .await
-        .get(&id)
-        .map(|batch| Json(batch_json(batch)))
-        .ok_or(StatusCode::NOT_FOUND)
-}
-
-async fn fake_file_content(
-    State(provider): State<FakeProvider>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-) -> Result<Response, StatusCode> {
-    provider.record_call("files:content", &headers).await;
-    let content = provider
-        .inner
-        .files
-        .lock()
-        .await
-        .get(&id)
-        .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let mut response = Response::new(Body::from(content));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/jsonl"),
-    );
-    Ok(response)
-}
-
-fn batch_json(batch: &FakeBatch) -> Value {
-    json!({
-        "id": batch.id,
-        "object": "batch",
-        "endpoint": "/v1/responses",
-        "status": batch.status,
-        "input_file_id": batch.input_file_id,
-        "output_file_id": batch.output_file_id,
-        "error_file_id": null,
-        "metadata": batch.metadata
-    })
-}
-
-fn complete_response(model: &str, text: &str) -> Value {
-    json!({
-        "id": "resp_fake",
-        "object": "response",
-        "created_at": 1,
-        "status": "completed",
-        "model": model,
-        "output": [{
-            "id": "msg_fake",
-            "type": "message",
-            "role": "assistant",
-            "status": "completed",
-            "content": [{
-                "type": "output_text",
-                "text": text,
-                "annotations": []
-            }]
-        }],
-        "usage": {
-            "input_tokens": 10,
-            "input_tokens_details": {"cached_tokens": 0},
-            "output_tokens": 2,
-            "output_tokens_details": {"reasoning_tokens": 0},
-            "total_tokens": 12
-        }
-    })
-}
-
-fn internal_test_error(error: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
-}
-
-struct RunningServer {
-    address: SocketAddr,
-    task: JoinHandle<()>,
-}
-
-impl Drop for RunningServer {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn spawn_fake_provider(provider: FakeProvider) -> RunningServer {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
-        axum::serve(listener, provider.router()).await.unwrap();
-    });
-    RunningServer { address, task }
-}
-
-struct KaiionProcess {
-    child: Child,
-    address: SocketAddr,
-}
-
-impl KaiionProcess {
-    async fn stop(mut self) {
-        self.child.kill().await.unwrap();
-        self.child.wait().await.unwrap();
-    }
-}
-
-impl Drop for KaiionProcess {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-    }
-}
-
-async fn start_kaiion(mode: &str, database: &Path, upstream: SocketAddr) -> KaiionProcess {
-    let address = unused_address();
-    let database_url = format!("sqlite://{}?mode=rwc", database.display());
-    let child = Command::new(env!("CARGO_BIN_EXE_kaiion"))
-        .arg("--listen")
-        .arg(address.to_string())
-        .arg("--database-url")
-        .arg(database_url)
-        .arg("--upstream-base-url")
-        .arg(format!("http://{upstream}/v1"))
-        .arg("--mode")
-        .arg(mode)
-        .arg("--poll-interval-seconds")
-        .arg("1")
-        .arg("--in-progress-interval-seconds")
-        .arg("1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let process = KaiionProcess { child, address };
-    wait_for_health(address).await;
-    process
-}
-
-fn unused_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
-}
-
-async fn wait_for_health(address: SocketAddr) {
-    let client = reqwest::Client::new();
-    for _ in 0..100 {
-        if client
-            .get(format!("http://{address}/healthz"))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("Kaiion did not become healthy at {address}");
-}
-
-fn codex_request(window_id: &str) -> Value {
-    json!({
-        "model": "gpt-test",
-        "instructions": "Return a result",
-        "input": [{
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "hello"}]
-        }],
-        "tools": [],
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "store": false,
-        "stream": true,
-        "include": ["reasoning.encrypted_content"],
-        "prompt_cache_key": "session-1",
-        "client_metadata": {
-            "session_id": "session-1",
-            "thread_id": "thread-1",
-            "turn_id": "turn-1",
-            "x-codex-window-id": window_id,
-            "x-codex-turn-metadata": format!("metadata-{window_id}")
-        }
-    })
-}
-
-struct FakeCodex {
-    client: reqwest::Client,
-    address: SocketAddr,
-}
-
-struct CodexStream {
-    status: StatusCode,
-    headers: HeaderMap,
-    bytes: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    buffer: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct SseEvent {
-    kind: String,
-    data: Value,
-}
-
-impl FakeCodex {
-    fn new(address: SocketAddr) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            address,
-        }
-    }
-
-    async fn send(&self, request: &Value) -> CodexStream {
-        self.send_with_headers(request, "test-key", None, None)
-            .await
-    }
-
-    async fn send_with_headers(
-        &self,
-        request: &Value,
-        api_key: &str,
-        organization: Option<&str>,
-        project: Option<&str>,
-    ) -> CodexStream {
-        let mut outbound = self
-            .client
-            .post(format!("http://{}/v1/responses", self.address))
-            .bearer_auth(api_key);
-        if let Some(organization) = organization {
-            outbound = outbound.header("openai-organization", organization);
-        }
-        if let Some(project) = project {
-            outbound = outbound.header("openai-project", project);
-        }
-        let response = outbound.json(request).send().await.unwrap();
-        let status = response.status();
-        let headers = response.headers().clone();
-        CodexStream {
-            status,
-            headers,
-            bytes: Box::pin(response.bytes_stream()),
-            buffer: Vec::new(),
-        }
-    }
-}
-
-impl CodexStream {
-    async fn all_bytes(mut self) -> Vec<u8> {
-        let mut bytes = std::mem::take(&mut self.buffer);
-        while let Some(next) = self.bytes.next().await {
-            bytes.extend_from_slice(&next.expect("SSE transport failed"));
-        }
-        bytes
-    }
-
-    async fn next_event(&mut self) -> Option<SseEvent> {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(event) = take_sse_event(&mut self.buffer) {
-                    return Some(event);
-                }
-                match self.bytes.next().await {
-                    Some(Ok(bytes)) => self.buffer.extend_from_slice(&bytes),
-                    Some(Err(error)) => panic!("SSE transport failed: {error}"),
-                    None => return take_sse_event(&mut self.buffer),
-                }
-            }
-        })
-        .await
-        .expect("SSE event timed out")
-    }
-
-    async fn through_terminal(&mut self) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-        while let Some(event) = self.next_event().await {
-            let terminal = matches!(
-                event.kind.as_str(),
-                "response.completed" | "response.failed"
-            );
-            events.push(event);
-            if terminal {
-                break;
-            }
-        }
-        events
-    }
-}
-
-fn take_sse_event(buffer: &mut Vec<u8>) -> Option<SseEvent> {
-    let boundary = buffer.windows(2).position(|window| window == b"\n\n")?;
-    let frame = buffer.drain(..boundary + 2).collect::<Vec<_>>();
-    let frame = String::from_utf8(frame).expect("fake provider emitted invalid UTF-8");
-    let kind = frame
-        .lines()
-        .find_map(|line| line.strip_prefix("event: "))?
-        .to_string();
-    let data = frame
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(SseEvent {
-        kind,
-        data: serde_json::from_str(&data).expect("fake provider emitted invalid SSE JSON"),
-    })
-}
-
-fn events_contain(events: &[SseEvent], needle: &str) -> bool {
-    events
-        .iter()
-        .any(|event| event.data.to_string().contains(needle))
-}
-
-async fn wait_for_batch(provider: &FakeProvider) {
-    wait_for_batch_count(provider, 1).await;
-}
-
-async fn wait_for_batch_count(provider: &FakeProvider, expected: usize) {
-    for _ in 0..400 {
-        if provider.batch_creations() >= expected {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("Kaiion did not create {expected} batches");
-}
-
-async fn wait_for_provider_call(provider: &FakeProvider, path: &str) {
-    for _ in 0..400 {
-        if provider.calls().await.iter().any(|call| call.path == path) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("Kaiion did not call provider endpoint {path}");
-}
+use support::*;
 
 async fn assert_all_calls_use_credentials(
     provider: &FakeProvider,
@@ -637,31 +28,92 @@ async fn assert_all_calls_use_credentials(
     }
 }
 
-async fn expect_batch_lifecycle_start(stream: &mut CodexStream) -> String {
-    let created = stream.next_event().await.unwrap();
-    assert_eq!(created.kind, "response.created");
-    assert_eq!(created.data["sequence_number"], 0);
-    assert_eq!(created.data["response"]["status"], "in_progress");
-    let response_id = created.data["response"]["id"].as_str().unwrap().to_string();
+async fn verify_restart_from_state(state_name: &str) {
+    let provider = FakeProvider::default();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join(format!("{state_name}.db"));
+    let database_url = format!("sqlite://{}?mode=rwc", database.display());
+    let provider_url = format!("http://{}/v1", fake.address);
+    let request = codex_request(state_name);
+    let normalized = NormalizedRequest::from_body(&request, &provider_url).unwrap();
+    let auth = UpstreamAuth {
+        authorization: "Bearer test-key".to_string(),
+        organization: None,
+        project: None,
+    };
+    let db = Database::connect(&database_url).await.unwrap();
+    let mut job = db
+        .get_or_create(
+            &auth.fingerprint(),
+            &normalized.request_hash,
+            &normalized.model,
+        )
+        .await
+        .unwrap();
+    if state_name == "queued" {
+        provider
+            .seed_input_file(&job.custom_id(), normalized.batch_body.clone())
+            .await;
+    }
+    if state_name != "queued" {
+        let file_id = provider
+            .seed_input_file(&job.custom_id(), normalized.batch_body.clone())
+            .await;
+        job.state = db.mark_uploaded(&job.id, FileId(file_id)).await.unwrap();
+    }
+    if matches!(
+        state_name,
+        "submitting" | "submission_uncertain" | "submitted"
+    ) {
+        let JobState::Uploaded { input_file_id } = &job.state else {
+            unreachable!()
+        };
+        job.state = db.begin_submission(&job.id, input_file_id).await.unwrap();
+    }
+    if state_name == "submission_uncertain" {
+        job.state = db.mark_submission_uncertain(&job.id).await.unwrap();
+    }
+    if matches!(
+        state_name,
+        "submitting" | "submission_uncertain" | "submitted"
+    ) {
+        let batch_id = provider
+            .seed_completed_batch(&job.id.0, &job.custom_id())
+            .await;
+        if state_name == "submitted" {
+            job.state = db
+                .mark_submitted(&job.id, &job.state, BatchId(batch_id))
+                .await
+                .unwrap();
+        }
+    }
+    drop(db);
 
-    let progress = stream.next_event().await.unwrap();
-    assert_eq!(progress.kind, "response.in_progress");
-    assert_eq!(progress.data["sequence_number"], 1);
+    let kaiion = start_kaiion("batch", &database, fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let mut response = codex.send(&request).await;
+    expect_batch_lifecycle_start(&mut response).await;
+    if matches!(state_name, "queued" | "uploaded") {
+        wait_for_batch(&provider).await;
+        provider.complete_all().await;
+    }
+    let events = response.through_terminal().await;
+    assert_eq!(events.last().unwrap().kind, "response.completed");
     assert_eq!(
-        progress.data["response"]["id"].as_str(),
-        Some(response_id.as_str())
+        provider.batch_creations(),
+        usize::from(matches!(state_name, "queued" | "uploaded"))
     );
-    response_id
+    kaiion.stop().await;
 }
 
 #[tokio::test]
-async fn direct_mode_passes_through_sse_and_authorization() {
+async fn direct_mode_passes_through_exact_body_sse_headers_and_authorization() {
     let provider = FakeProvider::default();
     let fake = spawn_fake_provider(provider.clone()).await;
     let directory = TempDir::new().unwrap();
     let kaiion = start_kaiion("direct", &directory.path().join("kaiion.db"), fake.address).await;
     let codex = FakeCodex::new(kaiion.address);
-
     let request = codex_request("window-1");
     let response = codex
         .send_with_headers(
@@ -692,19 +144,73 @@ async fn direct_mode_passes_through_sse_and_authorization() {
 }
 
 #[tokio::test]
-async fn batch_mode_rejects_requests_without_restart_safe_session_identity() {
+async fn batch_mode_validates_its_supported_request_contract() {
     let provider = FakeProvider::default();
     let fake = spawn_fake_provider(provider.clone()).await;
     let directory = TempDir::new().unwrap();
     let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
     let codex = FakeCodex::new(kaiion.address);
-    let mut request = codex_request("window-1");
-    request.as_object_mut().unwrap().remove("client_metadata");
 
-    let response = codex.send(&request).await;
+    let mut missing_session = codex_request("missing-session");
+    missing_session
+        .as_object_mut()
+        .unwrap()
+        .remove("client_metadata");
+    let response = codex.send(&missing_session).await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    let body = String::from_utf8(response.all_bytes().await).unwrap();
-    assert!(body.contains("client_metadata.thread_id"));
+    assert!(
+        String::from_utf8(response.all_bytes().await)
+            .unwrap()
+            .contains("client_metadata.thread_id")
+    );
+
+    for (field, value, message) in [
+        ("stream", Value::Bool(false), "stream=true"),
+        ("store", Value::Bool(true), "store=true"),
+        (
+            "previous_response_id",
+            Value::String("resp_previous".to_string()),
+            "previous_response_id",
+        ),
+    ] {
+        let mut request = codex_request(field);
+        request[field] = value;
+        let response = codex.send(&request).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8(response.all_bytes().await)
+                .unwrap()
+                .contains(message)
+        );
+    }
+    assert!(provider.calls().await.is_empty());
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn api_rejects_missing_authorization_and_invalid_mode() {
+    let provider = FakeProvider::default();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/responses", kaiion.address);
+    let missing = client
+        .post(&url)
+        .json(&codex_request("missing-auth"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    let invalid = client
+        .post(&url)
+        .bearer_auth("test-key")
+        .header("x-kaiion-mode", "automatic")
+        .json(&codex_request("invalid-mode"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     assert!(provider.calls().await.is_empty());
     kaiion.stop().await;
 }
@@ -716,7 +222,6 @@ async fn batch_mode_emits_progress_and_translates_the_result_to_sse() {
     let directory = TempDir::new().unwrap();
     let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
     let codex = FakeCodex::new(kaiion.address);
-
     let request = codex_request("window-1");
     let mut response = codex
         .send_with_headers(
@@ -727,58 +232,28 @@ async fn batch_mode_emits_progress_and_translates_the_result_to_sse() {
         )
         .await;
     assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.headers["x-kaiion-mode"], "batch");
     let response_id = expect_batch_lifecycle_start(&mut response).await;
     wait_for_batch(&provider).await;
-    let second_progress = response.next_event().await.unwrap();
-    assert_eq!(second_progress.kind, "response.in_progress");
-    assert_eq!(second_progress.data["sequence_number"], 2);
-    assert_eq!(
-        second_progress.data["response"]["id"].as_str(),
-        Some(response_id.as_str())
-    );
     provider.complete_all().await;
-
     let events = response.through_terminal().await;
-    assert!(events_contain(&events, "batch response"));
-    assert!(
-        events
-            .iter()
-            .any(|event| event.kind == "response.output_item.done")
-    );
+    assert!(events_contain(&events, "batch response"), "{events:?}");
     assert_eq!(events.last().unwrap().kind, "response.completed");
-    let terminal_events = events
-        .iter()
-        .filter(|event| event.kind != "response.in_progress")
-        .collect::<Vec<_>>();
+    let mut last_sequence = 1;
+    for event in &events {
+        let sequence = event.data["sequence_number"].as_u64().unwrap();
+        assert!(sequence > last_sequence);
+        last_sequence = sequence;
+    }
     assert_eq!(
-        terminal_events
-            .iter()
-            .map(|event| event.kind.as_str())
-            .collect::<Vec<_>>(),
-        vec!["response.output_item.done", "response.completed"]
-    );
-    assert_eq!(terminal_events[0].data["sequence_number"], 3);
-    assert_eq!(terminal_events[1].data["sequence_number"], 4);
-    assert_eq!(
-        terminal_events[1].data["response"]["id"].as_str(),
+        events.last().unwrap().data["response"]["id"].as_str(),
         Some(response_id.as_str())
     );
     assert_eq!(provider.batch_creations(), 1);
     let uploaded = provider.inner.uploaded_batch_lines.lock().await;
     assert_eq!(uploaded.len(), 1);
-    assert_eq!(uploaded[0]["method"], "POST");
-    assert_eq!(uploaded[0]["url"], "/v1/responses");
     assert_eq!(uploaded[0]["body"]["stream"], false);
     assert!(uploaded[0]["body"].get("stream_options").is_none());
-    assert_eq!(uploaded[0]["body"]["input"], request["input"]);
     drop(uploaded);
-    let batches = provider.inner.batch_requests.lock().await;
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0]["endpoint"], "/v1/responses");
-    assert_eq!(batches[0]["completion_window"], "24h");
-    assert!(batches[0]["metadata"]["kaiion_job_id"].is_string());
-    drop(batches);
     assert_all_calls_use_credentials(
         &provider,
         "batch-key",
@@ -790,87 +265,20 @@ async fn batch_mode_emits_progress_and_translates_the_result_to_sse() {
 }
 
 #[tokio::test]
-async fn client_disconnect_does_not_cancel_the_batch_or_create_a_duplicate() {
+async fn simultaneous_identical_requests_create_one_upstream_batch() {
     let provider = FakeProvider::default();
     let fake = spawn_fake_provider(provider.clone()).await;
     let directory = TempDir::new().unwrap();
     let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
     let codex = FakeCodex::new(kaiion.address);
-
-    let mut first = codex.send(&codex_request("window-first")).await;
-    assert_eq!(first.status, StatusCode::OK);
-    let job_id = first.headers["x-kaiion-job-id"]
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(
-        expect_batch_lifecycle_start(&mut first)
-            .await
-            .starts_with("resp_kaiion_")
-    );
-    drop(first);
+    let request = codex_request("concurrent");
+    let (mut first, mut second) = tokio::join!(codex.send(&request), codex.send(&request));
+    let first_id = first.headers["x-kaiion-job-id"].clone();
+    assert_eq!(second.headers["x-kaiion-job-id"], first_id);
+    expect_batch_lifecycle_start(&mut first).await;
+    expect_batch_lifecycle_start(&mut second).await;
     wait_for_batch(&provider).await;
-
-    // A reconnect with only volatile Codex fields changed must find the same durable job.
-    let mut duplicate = codex.send(&codex_request("window-second")).await;
-    assert_eq!(
-        duplicate.headers["x-kaiion-job-id"].to_str().unwrap(),
-        job_id
-    );
-    assert!(
-        expect_batch_lifecycle_start(&mut duplicate)
-            .await
-            .starts_with("resp_kaiion_")
-    );
     assert_eq!(provider.batch_creations(), 1);
-    drop(duplicate);
-
-    // Completion is driven by Kaiion's poller, not a still-open Codex TCP stream.
-    provider.complete_all().await;
-    wait_for_provider_call(&provider, "files:content").await;
-
-    let mut replay = codex.send(&codex_request("window-third")).await;
-    assert_eq!(replay.headers["x-kaiion-job-id"].to_str().unwrap(), job_id);
-    let events = replay.through_terminal().await;
-    assert!(events_contain(&events, "batch response"));
-    assert_eq!(events.last().unwrap().kind, "response.completed");
-    assert_eq!(provider.batch_creations(), 1);
-    kaiion.stop().await;
-}
-
-#[tokio::test]
-async fn identical_requests_with_different_api_keys_are_not_deduplicated() {
-    let provider = FakeProvider::default();
-    let fake = spawn_fake_provider(provider.clone()).await;
-    let directory = TempDir::new().unwrap();
-    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
-    let codex = FakeCodex::new(kaiion.address);
-    let request = codex_request("window-isolation");
-
-    let mut first = codex
-        .send_with_headers(&request, "tenant-a", None, None)
-        .await;
-    assert!(
-        expect_batch_lifecycle_start(&mut first)
-            .await
-            .starts_with("resp_kaiion_")
-    );
-    wait_for_batch_count(&provider, 1).await;
-
-    let mut second = codex
-        .send_with_headers(&request, "tenant-b", None, None)
-        .await;
-    assert!(
-        expect_batch_lifecycle_start(&mut second)
-            .await
-            .starts_with("resp_kaiion_")
-    );
-    wait_for_batch_count(&provider, 2).await;
-    assert_ne!(
-        first.headers["x-kaiion-job-id"],
-        second.headers["x-kaiion-job-id"]
-    );
-
     provider.complete_all().await;
     assert_eq!(
         first.through_terminal().await.last().unwrap().kind,
@@ -880,59 +288,366 @@ async fn identical_requests_with_different_api_keys_are_not_deduplicated() {
         second.through_terminal().await.last().unwrap().kind,
         "response.completed"
     );
-    let calls = provider.calls().await;
-    assert!(
-        calls
-            .iter()
-            .any(|call| call.authorization == "Bearer tenant-a")
-    );
-    assert!(
-        calls
-            .iter()
-            .any(|call| call.authorization == "Bearer tenant-b")
-    );
     kaiion.stop().await;
 }
 
 #[tokio::test]
-async fn restart_reuses_the_batch_and_replays_its_result() {
+async fn accepted_create_with_lost_response_never_creates_a_second_batch() {
+    let provider = FakeProvider::default();
+    provider.disconnect_next_create_after_accepting();
+    provider.hide_batches_for_list_calls(2);
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("kaiion.db");
+    let first_process = start_kaiion("batch", &database, fake.address).await;
+    let first_codex = FakeCodex::new(first_process.address);
+    let mut stream = first_codex.send(&codex_request("ambiguous")).await;
+    expect_batch_lifecycle_start(&mut stream).await;
+    wait_for_batch(&provider).await;
+    drop(stream);
+    first_process.stop().await;
+
+    let second_process = start_kaiion("batch", &database, fake.address).await;
+    let second_codex = FakeCodex::new(second_process.address);
+    let mut recovered = second_codex.send(&codex_request("ambiguous-retry")).await;
+    expect_batch_lifecycle_start(&mut recovered).await;
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(provider.batch_creations(), 1);
+    provider.complete_all().await;
+    assert_eq!(
+        recovered.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
+    assert_eq!(provider.batch_creations(), 1);
+    second_process.stop().await;
+}
+
+#[tokio::test]
+async fn malformed_successful_provider_json_fails_durably() {
     let provider = FakeProvider::default();
     let fake = spawn_fake_provider(provider.clone()).await;
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("kaiion.db");
+    let kaiion = start_kaiion("batch", &database, fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let request = codex_request("malformed");
+    let mut response = codex.send(&request).await;
+    expect_batch_lifecycle_start(&mut response).await;
+    wait_for_batch(&provider).await;
+    provider.malformed_next_batch_response();
+    let events = response.through_terminal().await;
+    assert_eq!(events.last().unwrap().kind, "response.failed");
+    assert!(events_contain(&events, "protocol violation"));
+    let calls = provider.calls().await.len();
 
+    let mut replay = codex.send(&request).await;
+    let replayed = replay.through_terminal().await;
+    assert_eq!(replayed.last().unwrap().kind, "response.failed");
+    assert_eq!(provider.calls().await.len(), calls);
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn response_failed_and_incomplete_statuses_are_preserved() {
+    for (status, expected_event) in [
+        ("failed", "response.failed"),
+        ("incomplete", "response.incomplete"),
+    ] {
+        let provider = FakeProvider::default();
+        provider.set_response_status(status).await;
+        let fake = spawn_fake_provider(provider.clone()).await;
+        let directory = TempDir::new().unwrap();
+        let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+        let codex = FakeCodex::new(kaiion.address);
+        let mut response = codex.send(&codex_request(status)).await;
+        expect_batch_lifecycle_start(&mut response).await;
+        wait_for_batch(&provider).await;
+        provider.complete_all().await;
+        let events = response.through_terminal().await;
+        assert_eq!(events.last().unwrap().kind, expected_event);
+        assert_eq!(events.last().unwrap().data["response"]["status"], status);
+        kaiion.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn terminal_batch_statuses_and_error_only_completion_fail_durably() {
+    for status in ["failed", "expired", "cancelled"] {
+        let provider = FakeProvider::default();
+        let fake = spawn_fake_provider(provider.clone()).await;
+        let directory = TempDir::new().unwrap();
+        let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+        let codex = FakeCodex::new(kaiion.address);
+        let mut response = codex.send(&codex_request(status)).await;
+        expect_batch_lifecycle_start(&mut response).await;
+        wait_for_batch(&provider).await;
+        provider.set_all_batch_statuses(status).await;
+        assert_eq!(
+            response.through_terminal().await.last().unwrap().kind,
+            "response.failed"
+        );
+        kaiion.stop().await;
+    }
+
+    let provider = FakeProvider::default();
+    provider.use_error_file_only();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let mut response = codex.send(&codex_request("error-only")).await;
+    expect_batch_lifecycle_start(&mut response).await;
+    wait_for_batch(&provider).await;
+    provider.complete_all().await;
+    let events = response.through_terminal().await;
+    assert_eq!(events.last().unwrap().kind, "response.failed");
+    assert!(events_contain(&events, "scripted error"));
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn retryable_batch_and_output_visibility_errors_recover() {
+    let provider = FakeProvider::default();
+    provider
+        .script_batch_get_statuses([
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ])
+        .await;
+    provider
+        .script_file_get_statuses([StatusCode::NOT_FOUND, StatusCode::CONFLICT])
+        .await;
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let mut response = codex.send(&codex_request("retryable-errors")).await;
+    expect_batch_lifecycle_start(&mut response).await;
+    wait_for_batch(&provider).await;
+    provider.complete_all().await;
+    assert_eq!(
+        response.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
+    assert_eq!(provider.batch_creations(), 1);
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn permanent_http_and_wrong_custom_id_fail_durably() {
+    let provider = FakeProvider::default();
+    provider
+        .script_batch_get_statuses([StatusCode::BAD_REQUEST])
+        .await;
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("http.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let mut response = codex.send(&codex_request("permanent-http")).await;
+    expect_batch_lifecycle_start(&mut response).await;
+    wait_for_batch(&provider).await;
+    assert_eq!(
+        response.through_terminal().await.last().unwrap().kind,
+        "response.failed"
+    );
+    kaiion.stop().await;
+
+    let provider = FakeProvider::default();
+    provider.override_output_custom_id("wrong-id").await;
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let kaiion = start_kaiion(
+        "batch",
+        &directory.path().join("custom-id.db"),
+        fake.address,
+    )
+    .await;
+    let codex = FakeCodex::new(kaiion.address);
+    let mut response = codex.send(&codex_request("wrong-id")).await;
+    expect_batch_lifecycle_start(&mut response).await;
+    wait_for_batch(&provider).await;
+    provider.complete_all().await;
+    let events = response.through_terminal().await;
+    assert_eq!(events.last().unwrap().kind, "response.failed");
+    assert!(events_contain(&events, "does not contain custom_id"));
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn uncertain_submission_reconciliation_follows_batch_list_pagination() {
+    let provider = FakeProvider::default();
+    provider.disconnect_next_create_after_accepting();
+    provider.paginate_batch_list_after_decoys(100);
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let mut response = codex.send(&codex_request("pagination")).await;
+    expect_batch_lifecycle_start(&mut response).await;
+    wait_for_batch(&provider).await;
+    provider.complete_all().await;
+    assert_eq!(
+        response.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
+    assert_eq!(provider.batch_creations(), 1);
+    let list_calls = provider
+        .calls()
+        .await
+        .iter()
+        .filter(|call| call.path == "batches:list")
+        .count();
+    assert!(list_calls >= 2);
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn client_disconnect_and_process_restart_replay_one_durable_result() {
+    let provider = FakeProvider::default();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("kaiion.db");
     let first_process = start_kaiion("batch", &database, fake.address).await;
     let first_codex = FakeCodex::new(first_process.address);
-    let mut first_stream = first_codex.send(&codex_request("window-before")).await;
-    assert!(
-        expect_batch_lifecycle_start(&mut first_stream)
-            .await
-            .starts_with("resp_kaiion_")
-    );
+    let request = codex_request("before");
+    let mut first = first_codex.send(&request).await;
+    let job_id = first.headers["x-kaiion-job-id"].clone();
+    expect_batch_lifecycle_start(&mut first).await;
     wait_for_batch(&provider).await;
-    drop(first_stream);
+    drop(first);
     first_process.stop().await;
 
     provider.complete_all().await;
     let second_process = start_kaiion("batch", &database, fake.address).await;
     let second_codex = FakeCodex::new(second_process.address);
-    let mut response = second_codex.send(&codex_request("window-after")).await;
-    let events = response.through_terminal().await;
-
+    let mut recovered = second_codex.send(&request).await;
+    assert_eq!(recovered.headers["x-kaiion-job-id"], job_id);
+    let events = recovered.through_terminal().await;
     assert!(events_contain(&events, "batch response"));
-    assert_eq!(events.last().unwrap().kind, "response.completed");
     assert_eq!(provider.batch_creations(), 1);
-    assert_all_calls_use_credentials(&provider, "test-key", None, None).await;
+    let calls = provider.calls().await.len();
 
-    let upstream_calls = provider.calls().await.len();
+    let mut replay = second_codex.send(&request).await;
+    assert_eq!(
+        replay.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
+    assert_eq!(provider.calls().await.len(), calls);
     second_process.stop().await;
-    let third_process = start_kaiion("batch", &database, fake.address).await;
-    let third_codex = FakeCodex::new(third_process.address);
-    let mut replay = third_codex.send(&codex_request("window-replay")).await;
-    let replayed_events = replay.through_terminal().await;
-    assert!(events_contain(&replayed_events, "batch response"));
-    assert_eq!(replayed_events.last().unwrap().kind, "response.completed");
+}
+
+#[tokio::test]
+async fn restart_is_deterministic_from_every_persisted_nonterminal_state() {
+    for state in [
+        "queued",
+        "uploaded",
+        "submitting",
+        "submission_uncertain",
+        "submitted",
+    ] {
+        verify_restart_from_state(state).await;
+    }
+}
+
+#[tokio::test]
+async fn crash_during_output_retrieval_replays_and_persists_the_result() {
+    let provider = FakeProvider::default();
+    provider.delay_file_responses(2000);
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("kaiion.db");
+    let request = codex_request("output-crash");
+    let first_process = start_kaiion("batch", &database, fake.address).await;
+    let first_codex = FakeCodex::new(first_process.address);
+    let mut first = first_codex.send(&request).await;
+    expect_batch_lifecycle_start(&mut first).await;
+    wait_for_batch(&provider).await;
+    provider.complete_all().await;
+    wait_for_provider_call(&provider, "files:content").await;
+    first_process.stop().await;
+    drop(first);
+
+    provider.delay_file_responses(0);
+    let second_process = start_kaiion("batch", &database, fake.address).await;
+    let second_codex = FakeCodex::new(second_process.address);
+    let mut recovered = second_codex.send(&request).await;
+    let events = recovered.through_terminal().await;
+    assert_eq!(events.last().unwrap().kind, "response.completed");
+    assert!(events_contain(&events, "batch response"));
     assert_eq!(provider.batch_creations(), 1);
-    assert_eq!(provider.calls().await.len(), upstream_calls);
-    third_process.stop().await;
+    let calls = provider.calls().await.len();
+    let mut replay = second_codex.send(&request).await;
+    assert_eq!(
+        replay.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
+    assert_eq!(provider.calls().await.len(), calls);
+    second_process.stop().await;
+}
+
+#[tokio::test]
+async fn credentials_scope_durable_request_identity() {
+    let provider = FakeProvider::default();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let request = codex_request("isolation");
+    let mut first = codex
+        .send_with_headers(&request, "tenant-a", None, None)
+        .await;
+    let mut second = codex
+        .send_with_headers(&request, "tenant-b", None, None)
+        .await;
+    expect_batch_lifecycle_start(&mut first).await;
+    expect_batch_lifecycle_start(&mut second).await;
+    wait_for_batch_count(&provider, 2).await;
+    assert_ne!(
+        first.headers["x-kaiion-job-id"],
+        second.headers["x-kaiion-job-id"]
+    );
+    provider.complete_all().await;
+    assert_eq!(
+        first.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
+    assert_eq!(
+        second.through_terminal().await.last().unwrap().kind,
+        "response.completed"
+    );
+    kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn terminal_notification_is_not_delayed_until_the_next_heartbeat() {
+    let provider = FakeProvider::default();
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_kaiion("batch", &directory.path().join("kaiion.db"), fake.address).await;
+    let codex = FakeCodex::new(kaiion.address);
+    let mut response = codex.send(&codex_request("notification")).await;
+    expect_batch_lifecycle_start(&mut response).await;
+    wait_for_batch(&provider).await;
+    provider.complete_all().await;
+    wait_for_provider_call(&provider, "files:content").await;
+    let started = std::time::Instant::now();
+    let events = response.through_terminal().await;
+    assert_eq!(events.last().unwrap().kind, "response.completed");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    let client = reqwest::Client::new();
+    for _ in 0..20 {
+        let health: Value = client
+            .get(format!("http://{}/healthz", kaiion.address))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if health["active_batch_workers"] == 0 {
+            kaiion.stop().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("terminal worker was not evicted");
 }

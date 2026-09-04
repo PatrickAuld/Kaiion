@@ -1,5 +1,7 @@
 pub mod config;
 pub mod db;
+pub mod domain;
+pub mod driver;
 pub mod error;
 pub mod openai;
 pub mod proxy;

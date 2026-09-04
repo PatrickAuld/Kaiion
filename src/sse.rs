@@ -25,29 +25,6 @@ pub fn in_progress_event(response_id: &str, model: &str, sequence_number: u64) -
     )
 }
 
-/// Converts a completed Responses object to a complete standalone event
-/// sequence. This is retained for callers that already have no interim
-/// lifecycle events to send.
-pub fn completed_events(response: &Value) -> Result<Vec<Bytes>, ProxyError> {
-    let response_id = response
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ProxyError::Internal("batch response is missing id".to_string()))?;
-    let model = response
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ProxyError::Internal("batch response is missing model".to_string()))?;
-    let mut events = vec![
-        created_event(response_id, model, 0),
-        in_progress_event(response_id, model, 1),
-    ];
-    events.extend(completion_events(response, response_id, 2)?);
-    Ok(events)
-}
-
-/// Emits only the terminal portion of a lifecycle whose `created` and
-/// `in_progress` events were already sent. The proxy owns the response ID in
-/// batch mode, so every event in a connection uses one stable ID.
 pub fn completion_events(
     response: &Value,
     response_id: &str,
@@ -203,14 +180,14 @@ mod tests {
                 "total_tokens": 2
             }
         });
-        let encoded = completed_events(&response)
+        let encoded = completion_events(&response, "resp_kaiion_test", 2)
             .unwrap()
             .into_iter()
             .map(|event| String::from_utf8(event.to_vec()).unwrap())
             .collect::<String>();
-        assert!(encoded.contains("event: response.created"));
         assert!(encoded.contains("event: response.output_item.done"));
         assert!(encoded.contains("event: response.completed"));
+        assert!(encoded.contains("\"id\":\"resp_kaiion_test\""));
         assert!(encoded.contains("\"text\":\"done\""));
     }
 }

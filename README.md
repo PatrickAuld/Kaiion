@@ -9,6 +9,7 @@ Kaiion is a durable OpenAI Responses API proxy that lets Codex use either normal
 - Batch status is polled and the completed response is converted back into Responses SSE events.
 - `response.in_progress` events keep Codex's stream alive while Batch inference is pending.
 - SQLite stores upstream IDs and terminal responses so a reissued request can reconnect after either Codex or Kaiion restarts.
+- Batch jobs move through a typed durable state machine; each transition is an atomic compare-and-set operation.
 - The incoming API key, organization, and project headers are passed through to OpenAI. Credentials are never persisted; only a SHA-256 credential fingerprint is stored for request isolation.
 - No pooling, automatic routing, supervisor, or webhook receiver is included.
 
@@ -66,6 +67,8 @@ When Codex repeats an unfinished request:
 3. If the result is already stored, Kaiion immediately replays it as SSE.
 4. A changed prompt, tool result, thread, or turn creates a distinct job.
 
+The OpenAI Batch create endpoint does not currently document a stable idempotency-key contract. Kaiion therefore optimizes for at-most-once Batch cost rather than automatic liveness after an ambiguous create. Before creation it durably records `submitting`. If the create response is lost, or Kaiion restarts from that state, the job becomes `submission_uncertain`: Kaiion searches all Batch-list pages for its durable job metadata but never creates a replacement merely because a list response is negative. The state remains explicit in SQLite and reconciliation continues when a matching client supplies credentials. An operator must inspect the provider before choosing any manual retry; the MVP has no automatic or API-triggered retry path.
+
 Because API keys are deliberately not stored, Kaiion cannot poll after its own restart until a matching client request supplies the key again. While Kaiion remains running, its in-process poller continues after a client disconnects.
 
 Stock Codex currently records an interrupted in-progress turn when its process exits; it does not automatically resend that unfinished inference merely because `codex resume` starts. Kaiion recovery applies when Codex, a harness, or another client reissues the same request. Transparent automatic continuation would require a small Codex-side resend hook or an external launcher that replays the pending turn.
@@ -92,7 +95,7 @@ cargo test --test black_box -- --test-threads=1
 - Kaiion as a separate OS process.
 - A fake Codex client that sends streaming Responses requests and parses the returned SSE bytes.
 
-The suite verifies direct passthrough, API-key/organization/project passthrough, Batch wire conversion, `response.in_progress`, final SSE reconstruction, Codex disconnect behavior, durable deduplication, a full Kaiion process restart, SQLite recovery, and stored-result replay without further upstream calls.
+The suite verifies direct passthrough, API-key/organization/project passthrough, Batch wire conversion, `response.in_progress`, final SSE reconstruction, concurrent deduplication, ambiguous-create recovery with delayed list visibility, protocol-error termination, a full Kaiion process restart, and stored-result replay without further upstream calls. Provider, process, fixture, and SSE support live in focused modules under `tests/support`.
 
 ## API surface
 
@@ -100,4 +103,4 @@ The suite verifies direct passthrough, API-key/organization/project passthrough,
 - `POST /responses`
 - `GET /healthz`
 
-Batch mode currently requires `stream: true`, matching Codex's transport behavior.
+Batch mode is intentionally stateless from the Responses API perspective. It requires `stream: true`, `store: false`, no `previous_response_id`, a non-empty `model`, and stable `client_metadata.thread_id` or `client_metadata.session_id`. Kaiion rewrites `stream` to `false` only in the Batch input and replaces the provider response ID with a stable Kaiion response ID in emitted SSE. Stateful Responses usage will require a future durable provider/local response-ID mapping.

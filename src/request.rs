@@ -50,9 +50,7 @@ impl UpstreamAuth {
 pub struct NormalizedRequest {
     pub batch_body: Value,
     pub request_hash: String,
-    pub session_key: Option<String>,
     pub model: String,
-    pub stream: bool,
 }
 
 impl NormalizedRequest {
@@ -71,11 +69,35 @@ impl NormalizedRequest {
             .get("stream")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if !stream {
+            return Err(ProxyError::BadRequest(
+                "batch mode requires stream=true".to_string(),
+            ));
+        }
+        if object.get("store").and_then(Value::as_bool) == Some(true) {
+            return Err(ProxyError::BadRequest(
+                "batch mode does not support store=true".to_string(),
+            ));
+        }
+        if object
+            .get("previous_response_id")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(ProxyError::BadRequest(
+                "batch mode does not support previous_response_id".to_string(),
+            ));
+        }
+
+        let session_key = extract_session_key(object.get("client_metadata")).ok_or_else(|| {
+            ProxyError::BadRequest(
+                "batch mode requires client_metadata.thread_id or client_metadata.session_id for restart-safe request identity"
+                    .to_string(),
+            )
+        })?;
 
         object.insert("stream".to_string(), Value::Bool(false));
         object.remove("stream_options");
 
-        let session_key = extract_session_key(object.get("client_metadata"));
         let mut fingerprint_body = batch_body.clone();
         remove_volatile_codex_metadata(&mut fingerprint_body);
         let encoded = serde_json::to_vec(&fingerprint_body)?;
@@ -83,18 +105,35 @@ impl NormalizedRequest {
         // A persisted database can be reused after configuration changes.
         // Scope durable identities to the configured provider so an identical
         // request is never replayed from a different upstream deployment.
-        hash_component(&mut hasher, b"provider", provider_namespace);
+        hash_component(
+            &mut hasher,
+            b"provider",
+            &canonical_provider_url(provider_namespace)?,
+        );
+        hash_component(&mut hasher, b"session", &session_key);
         hash_bytes(&mut hasher, b"request", &encoded);
         let request_hash = hex_digest(hasher.finalize());
 
         Ok(Self {
             batch_body,
             request_hash,
-            session_key,
             model,
-            stream,
         })
     }
+}
+
+pub fn canonical_provider_url(value: &str) -> Result<String, ProxyError> {
+    let mut url = reqwest::Url::parse(value).map_err(|error| {
+        ProxyError::BadRequest(format!("invalid upstream provider URL: {error}"))
+    })?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ProxyError::BadRequest(
+            "upstream provider URL cannot contain a query or fragment".to_string(),
+        ));
+    }
+    let path = url.path().trim_end_matches('/').to_string();
+    url.set_path(&path);
+    Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
 pub fn resolve_mode(headers: &HeaderMap, default: Mode) -> Result<Mode, ProxyError> {
@@ -193,7 +232,7 @@ mod tests {
         });
         let second = json!({
             "model": "gpt-test",
-            "stream": false,
+            "stream": true,
             "input": [{"role": "user", "content": "hello"}],
             "client_metadata": {
                 "thread_id": "thread",
@@ -202,10 +241,9 @@ mod tests {
                 "x-codex-turn-metadata": "volatile-2"
             }
         });
-        let first = NormalizedRequest::from_body(&first, "provider-a").unwrap();
-        let second = NormalizedRequest::from_body(&second, "provider-a").unwrap();
+        let first = NormalizedRequest::from_body(&first, "https://provider-a.test/v1").unwrap();
+        let second = NormalizedRequest::from_body(&second, "https://provider-a.test/v1").unwrap();
         assert_eq!(first.request_hash, second.request_hash);
-        assert_eq!(first.session_key, second.session_key);
         assert_eq!(first.batch_body["stream"], false);
         assert!(first.batch_body.get("stream_options").is_none());
     }
@@ -214,19 +252,21 @@ mod tests {
     fn preserves_turn_identity_in_fingerprint() {
         let first = json!({
             "model": "gpt-test",
+            "stream": true,
             "input": [],
             "client_metadata": {"thread_id": "thread", "turn_id": "turn-1"}
         });
         let second = json!({
             "model": "gpt-test",
+            "stream": true,
             "input": [],
             "client_metadata": {"thread_id": "thread", "turn_id": "turn-2"}
         });
         assert_ne!(
-            NormalizedRequest::from_body(&first, "provider-a")
+            NormalizedRequest::from_body(&first, "https://provider-a.test/v1")
                 .unwrap()
                 .request_hash,
-            NormalizedRequest::from_body(&second, "provider-a")
+            NormalizedRequest::from_body(&second, "https://provider-a.test/v1")
                 .unwrap()
                 .request_hash
         );
@@ -236,16 +276,63 @@ mod tests {
     fn scopes_request_identity_to_the_provider() {
         let body = json!({
             "model": "gpt-test",
+            "stream": true,
             "input": [],
             "client_metadata": {"thread_id": "thread", "turn_id": "turn"}
         });
         assert_ne!(
-            NormalizedRequest::from_body(&body, "provider-a")
+            NormalizedRequest::from_body(&body, "https://provider-a.test/v1")
                 .unwrap()
                 .request_hash,
-            NormalizedRequest::from_body(&body, "provider-b")
+            NormalizedRequest::from_body(&body, "https://provider-b.test/v1")
                 .unwrap()
                 .request_hash
         );
+    }
+
+    #[test]
+    fn equivalent_provider_urls_share_an_identity() {
+        let body = json!({
+            "model": "gpt-test",
+            "stream": true,
+            "input": [],
+            "client_metadata": {"thread_id": "thread", "turn_id": "turn"}
+        });
+        assert_eq!(
+            NormalizedRequest::from_body(&body, "https://example.com/v1")
+                .unwrap()
+                .request_hash,
+            NormalizedRequest::from_body(&body, "https://example.com/v1/")
+                .unwrap()
+                .request_hash
+        );
+        assert_eq!(
+            NormalizedRequest::from_body(&body, "HTTPS://EXAMPLE.COM:443/v1/")
+                .unwrap()
+                .request_hash,
+            NormalizedRequest::from_body(&body, "https://example.com/v1")
+                .unwrap()
+                .request_hash
+        );
+    }
+
+    #[test]
+    fn rejects_stateful_response_semantics() {
+        for field in ["store", "previous_response_id"] {
+            let mut body = json!({
+                "model": "gpt-test",
+                "stream": true,
+                "client_metadata": {"thread_id": "thread"}
+            });
+            body[field] = if field == "store" {
+                Value::Bool(true)
+            } else {
+                Value::String("resp_previous".to_string())
+            };
+            assert!(matches!(
+                NormalizedRequest::from_body(&body, "https://provider.test/v1"),
+                Err(ProxyError::BadRequest(_))
+            ));
+        }
     }
 }
