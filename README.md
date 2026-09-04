@@ -19,12 +19,25 @@ Kaiion is a durable OpenAI Responses API proxy that lets Codex use either normal
 cargo run --release -- --mode batch
 ```
 
+For a managed local service, install the binary and use its lifecycle commands:
+
+```bash
+cargo install --path . --locked
+kaiiron start
+kaiiron status
+kaiiron logs --lines 100
+kaiiron restart
+kaiiron stop
+```
+
+`kaiion` and `kaiiron` are equivalent binary names. The service stores its effective configuration under `$XDG_CONFIG_HOME/kaiion` or `~/.config/kaiion`, and its database, PID, readiness marker, and log under `$XDG_STATE_HOME/kaiion` or `~/.local/state/kaiion`. Override those locations with `--config-dir`, `--state-dir`, `--pid-file`, and `--log-file`. `start` waits for a child-owned readiness marker and `/healthz` before returning. `stop` sends SIGTERM, escalating to SIGKILL if necessary. `restart` reuses the saved configuration and working directory, so it is not affected by a later shell directory or environment change.
+
 Environment variables mirror the CLI options:
 
 | Variable | Default |
 |---|---|
 | `KAIION_LISTEN` | `127.0.0.1:8787` |
-| `KAIION_DATABASE_URL` | `sqlite://kaiion.db?mode=rwc` |
+| `KAIION_DATABASE_URL` | `sqlite://~/.local/state/kaiion/kaiion.db?mode=rwc` |
 | `KAIION_MODE` | `batch` |
 | `KAIION_OPENAI_BASE_URL` | `https://api.openai.com/v1` |
 | `KAIION_POLL_INTERVAL_SECONDS` | `5` |
@@ -33,7 +46,21 @@ Environment variables mirror the CLI options:
 
 The default mode can be overridden per request with `X-Kaiion-Mode: batch` or `X-Kaiion-Mode: direct`. Those are the only supported execution modes.
 
-## Codex configuration
+## Client configuration
+
+Configure supported clients against the local proxy in one command:
+
+```bash
+kaiiron configure
+```
+
+This updates Codex, OpenCode, and Pi configuration files atomically while preserving unrelated settings. Use `--client codex`, `--client opencode`, or `--client pi` to select clients, `--home` to target another home directory, `--codex-home` or `CODEX_HOME` for a non-default Codex directory, `--model` to choose the model registered for OpenCode and Pi, and `--dry-run` to inspect the changes. OpenCode and Pi use direct mode by default because Kaiion's Batch contract requires stable Codex session metadata; pass `--batch` only when the client supplies that metadata.
+
+Claude Code is intentionally rejected by `configure --client claude`: Claude Code speaks Anthropic Messages, while this release exposes OpenAI Responses. Pointing `ANTHROPIC_BASE_URL` at Kaiion without a protocol adapter would fail at runtime.
+
+The configure command uses the local listener as its default endpoint (`http://127.0.0.1:8787/v1`). Override it with `--proxy-url`.
+
+### Codex configuration
 
 Add a user-level provider to `~/.codex/config.toml`:
 

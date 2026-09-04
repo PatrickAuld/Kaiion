@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, path::Path, process::Stdio, time::Duration};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use tokio::process::{Child, Command};
 
@@ -23,7 +29,18 @@ impl Drop for KaiionProcess {
 pub async fn start_kaiion(mode: &str, database: &Path, upstream: SocketAddr) -> KaiionProcess {
     let address = unused_address();
     let database_url = format!("sqlite://{}?mode=rwc", database.display());
-    let child = Command::new(env!("CARGO_BIN_EXE_kaiion"))
+    let executable = env::var_os("CARGO_BIN_EXE_kaiion")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .expect("integration test executable path")
+                .parent()
+                .expect("integration test executable directory")
+                .parent()
+                .expect("target directory")
+                .join("kaiion")
+        });
+    let child = Command::new(executable)
         .arg("--listen")
         .arg(address.to_string())
         .arg("--database-url")
