@@ -28,7 +28,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install supported agent CLIs
+        run: npm install --global @openai/codex@0.104.0 opencode-ai@1.18.28 @earendil-works/pi-coding-agent@0.85.0
       - run: cargo build --locked --all-features --bins
       - run: cargo test --locked --test black_box --all-features -- --test-threads=1
         env:
           KAIION_TEST_BINARY: ${{ github.workspace }}/target/debug/kaiion
+          KAIION_TEST_REAL_CLIS: "1"

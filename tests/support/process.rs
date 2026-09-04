@@ -48,10 +48,7 @@ pub async fn start_kaiion_with_env(
 ) -> KaiionProcess {
     let address = unused_address();
     let database_url = format!("sqlite://{}?mode=rwc", database.display());
-    let executable = env::var_os("KAIION_TEST_BINARY")
-        .map(PathBuf::from)
-        .or_else(|| option_env!("CARGO_BIN_EXE_kaiion").map(PathBuf::from))
-        .expect("build kaiion and set KAIION_TEST_BINARY to the executable path");
+    let executable = kaiion_binary();
     assert!(
         executable.is_file(),
         "Kaiion test binary does not exist at {}",
@@ -81,6 +78,13 @@ pub async fn start_kaiion_with_env(
     let process = KaiionProcess { child, address };
     wait_for_health(address).await;
     process
+}
+
+pub fn kaiion_binary() -> PathBuf {
+    env::var_os("KAIION_TEST_BINARY")
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_kaiion").map(PathBuf::from))
+        .expect("build kaiion and set KAIION_TEST_BINARY to the executable path")
 }
 
 fn unused_address() -> SocketAddr {

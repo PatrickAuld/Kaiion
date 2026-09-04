@@ -42,9 +42,86 @@ pub fn completion_events(
     object.insert("id".to_string(), Value::String(response_id.to_string()));
 
     let mut sequence = first_sequence_number;
-    let mut events = Vec::with_capacity(output.len() + 1);
+    let mut events = Vec::new();
 
     for (output_index, item) in output.iter().enumerate() {
+        events.push(event(
+            "response.output_item.added",
+            &json!({
+                "type": "response.output_item.added",
+                "sequence_number": sequence,
+                "output_index": output_index,
+                "item": item
+            }),
+        ));
+        sequence += 1;
+
+        if item.get("type").and_then(Value::as_str) == Some("message")
+            && let (Some(item_id), Some(content)) = (
+                item.get("id").and_then(Value::as_str),
+                item.get("content").and_then(Value::as_array),
+            )
+        {
+            for (content_index, part) in content.iter().enumerate() {
+                if part.get("type").and_then(Value::as_str) != Some("output_text") {
+                    continue;
+                }
+                let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+                events.push(event(
+                    "response.content_part.added",
+                    &json!({
+                        "type": "response.content_part.added",
+                        "sequence_number": sequence,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "part": {"type": "output_text", "text": "", "annotations": []}
+                    }),
+                ));
+                sequence += 1;
+                if !text.is_empty() {
+                    events.push(event(
+                        "response.output_text.delta",
+                        &json!({
+                            "type": "response.output_text.delta",
+                            "sequence_number": sequence,
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": content_index,
+                            "delta": text,
+                            "logprobs": []
+                        }),
+                    ));
+                    sequence += 1;
+                }
+                events.push(event(
+                    "response.output_text.done",
+                    &json!({
+                        "type": "response.output_text.done",
+                        "sequence_number": sequence,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "text": text,
+                        "logprobs": []
+                    }),
+                ));
+                sequence += 1;
+                events.push(event(
+                    "response.content_part.done",
+                    &json!({
+                        "type": "response.content_part.done",
+                        "sequence_number": sequence,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "part": part
+                    }),
+                ));
+                sequence += 1;
+            }
+        }
+
         events.push(event(
             "response.output_item.done",
             &json!({
@@ -186,6 +263,11 @@ mod tests {
             .map(|event| String::from_utf8(event.to_vec()).unwrap())
             .collect::<String>();
         assert!(encoded.contains("event: response.output_item.done"));
+        assert!(encoded.contains("event: response.output_item.added"));
+        assert!(encoded.contains("event: response.output_text.delta"));
+        assert!(encoded.contains("event: response.output_text.done"));
+        assert!(encoded.contains("event: response.content_part.added"));
+        assert!(encoded.contains("event: response.content_part.done"));
         assert!(encoded.contains("event: response.completed"));
         assert!(encoded.contains("\"id\":\"resp_kaiion_test\""));
         assert!(encoded.contains("\"text\":\"done\""));

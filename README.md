@@ -121,9 +121,19 @@ cargo build --locked --all-features --bins
 KAIION_TEST_BINARY=target/debug/kaiion cargo test --locked --test black_box --all-features -- --test-threads=1
 ```
 
+The three real-client compatibility cases are enabled in CI. To run them locally, install the pinned clients and opt in:
+
+```bash
+npm install --global @openai/codex@0.104.0 opencode-ai@1.18.28 @earendil-works/pi-coding-agent@0.85.0
+KAIION_TEST_BINARY=target/debug/kaiion KAIION_TEST_REAL_CLIS=1 cargo test --locked --test black_box --all-features -- --test-threads=1
+```
+
+Override client locations with `KAIION_TEST_CODEX_BINARY`, `KAIION_TEST_OPENCODE_BINARY`, and `KAIION_TEST_PI_BINARY`.
+
 `tests/black_box.rs` launches:
 
 - A fake provider implementing synchronous Responses, Files, and Batch endpoints.
+- The real Codex, OpenCode, and Pi CLIs against isolated configurations produced by `kaiiron configure`; the provider holds each Batch in progress until the test releases it.
 - Kaiion as a separate OS process.
 - A fake Codex client that sends streaming Responses requests and parses the returned SSE bytes.
 

@@ -103,6 +103,16 @@ impl FakeProvider {
         }
     }
 
+    pub async fn batch_statuses(&self) -> Vec<String> {
+        self.inner
+            .batches
+            .lock()
+            .await
+            .values()
+            .map(|batch| batch.status.clone())
+            .collect()
+    }
+
     pub async fn set_all_batch_statuses(&self, status: &str) {
         for batch in self.inner.batches.lock().await.values_mut() {
             batch.status = status.to_string();
@@ -530,6 +540,7 @@ fn complete_response(model: &str, text: &str) -> Value {
         "object": "response",
         "created_at": 1,
         "status": "completed",
+        "incomplete_details": null,
         "model": model,
         "output": [{
             "id": "msg_fake",
@@ -537,7 +548,16 @@ fn complete_response(model: &str, text: &str) -> Value {
             "role": "assistant",
             "status": "completed",
             "content": [{"type": "output_text", "text": text, "annotations": []}]
-        }]
+        }],
+        "reasoning": null,
+        "service_tier": null,
+        "usage": {
+            "input_tokens": 1,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 2,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 3
+        }
     })
 }
 

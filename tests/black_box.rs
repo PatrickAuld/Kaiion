@@ -1,5 +1,7 @@
 #[path = "scenarios/auto_routing.rs"]
 mod auto_routing;
+#[path = "scenarios/client_compatibility.rs"]
+mod client_compatibility;
 #[path = "scenarios/durable_jobs.rs"]
 mod durable_jobs;
 mod support;
