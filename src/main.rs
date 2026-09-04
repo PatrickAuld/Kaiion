@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Status { json } => lifecycle::status(&cli.server, &paths, json).await?,
         Command::Logs { lines } => lifecycle::logs(&paths, lines)?,
         Command::Configure(_) => configure::configure(&configure_options.unwrap())?,
+        Command::Jobs(command) => kaiion::job_cli::run(command, cli.server.listen).await?,
     }
     Ok(())
 }

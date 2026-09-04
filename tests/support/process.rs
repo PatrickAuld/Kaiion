@@ -27,6 +27,25 @@ impl Drop for KaiionProcess {
 }
 
 pub async fn start_kaiion(mode: &str, database: &Path, upstream: SocketAddr) -> KaiionProcess {
+    start_kaiion_with_args(mode, database, upstream, &[]).await
+}
+
+pub async fn start_kaiion_with_args(
+    mode: &str,
+    database: &Path,
+    upstream: SocketAddr,
+    args: &[&str],
+) -> KaiionProcess {
+    start_kaiion_with_env(mode, database, upstream, args, &[]).await
+}
+
+pub async fn start_kaiion_with_env(
+    mode: &str,
+    database: &Path,
+    upstream: SocketAddr,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> KaiionProcess {
     let address = unused_address();
     let database_url = format!("sqlite://{}?mode=rwc", database.display());
     let executable = env::var_os("KAIION_TEST_BINARY")
@@ -51,6 +70,10 @@ pub async fn start_kaiion(mode: &str, database: &Path, upstream: SocketAddr) -> 
         .arg("1")
         .arg("--in-progress-interval-seconds")
         .arg("1")
+        .args(args)
+        .env_remove("KAIION_ROUTING_POLICY")
+        .env_remove("KAIION_RESUME_FROM_ENV")
+        .envs(env.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

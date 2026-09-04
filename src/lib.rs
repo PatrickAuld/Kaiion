@@ -5,10 +5,14 @@ pub mod db;
 pub mod domain;
 pub mod driver;
 pub mod error;
+pub mod job_cli;
+mod job_store;
+pub mod jobs;
 pub mod lifecycle;
 pub mod openai;
 pub mod proxy;
 pub mod request;
+pub mod routing;
 pub mod sse;
 
 pub use config::{Cli, Command, Config};

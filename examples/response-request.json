@@ -1,0 +1,6 @@
+{
+  "model": "replace-with-your-batch-capable-model",
+  "input": "Investigate the next step in this workflow.",
+  "store": false,
+  "max_output_tokens": 4096
+}

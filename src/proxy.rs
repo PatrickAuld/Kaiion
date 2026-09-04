@@ -18,19 +18,25 @@ use crate::{
     domain::{JobState, StoredOutcome},
     driver::WorkerRegistry,
     error::ProxyError,
+    jobs,
     openai::{OpenAiClient, copy_response_headers},
-    request::{NormalizedRequest, UpstreamAuth, resolve_mode},
+    request::{NormalizedRequest, UpstreamAuth, canonical_provider_url, resolve_mode},
+    routing::{RouteDecision, RoutingPolicy},
     sse,
 };
 
-struct AppState {
-    config: Config,
-    db: Database,
+pub(crate) struct AppState {
+    pub(crate) config: Config,
+    pub(crate) db: Database,
     upstream: OpenAiClient,
-    workers: WorkerRegistry,
+    pub(crate) workers: WorkerRegistry,
+    pub(crate) provider: String,
+    policy: RoutingPolicy,
 }
 
 pub async fn build_router(config: Config) -> Result<Router, ProxyError> {
+    let policy = RoutingPolicy::load(config.routing_policy.as_deref())?;
+    let provider = canonical_provider_url(&config.upstream_base_url)?;
     let db = Database::connect(&config.database_url).await?;
     let upstream = OpenAiClient::new(&config.upstream_base_url)?;
     let workers = WorkerRegistry::new(db.clone(), upstream.clone(), config.poll_interval());
@@ -40,11 +46,20 @@ pub async fn build_router(config: Config) -> Result<Router, ProxyError> {
         db,
         upstream,
         workers,
+        policy,
+        provider,
     });
+    if state.config.resume_from_env {
+        jobs::resume_from_env(&state).await?;
+    }
     Ok(Router::new()
         .route("/healthz", get(health))
         .route("/responses", post(responses))
         .route("/v1/responses", post(responses))
+        .route("/v1/kaiion/jobs", post(jobs::submit).get(jobs::list))
+        .route("/v1/kaiion/jobs/{id}", get(jobs::get_job))
+        .route("/v1/kaiion/jobs/{id}/resume", post(jobs::resume))
+        .route("/v1/kaiion/route", post(explain_route))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state))
 }
@@ -61,10 +76,52 @@ async fn responses(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, ProxyError> {
-    match resolve_mode(&headers, state.config.mode)? {
-        Mode::Direct => direct_response(&state, &headers, &body).await,
-        Mode::Batch => batch_response(state, &headers, body).await,
+    let decision = route(&state, &headers, &body).await?;
+    let mut response = match decision.mode {
+        Mode::Direct => direct_response(&state, &headers, &body).await?,
+        Mode::Batch => batch_response(state, &headers, body).await?,
+        Mode::Auto => unreachable!("routing resolves auto to an execution mode"),
+    };
+    response.headers_mut().insert(
+        "x-kaiion-route-reason",
+        HeaderValue::from_static(decision.reason),
+    );
+    Ok(response)
+}
+
+async fn route(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Value,
+) -> Result<RouteDecision, ProxyError> {
+    let mode = resolve_mode(headers, state.config.mode)?;
+    if mode != Mode::Auto {
+        return Ok(RouteDecision::new(mode, "explicit_mode"));
     }
+    let auth = UpstreamAuth::from_headers(headers)?;
+    let request = NormalizedRequest::from_headers(body, &state.provider, headers)?;
+    state
+        .db
+        .check_idempotency(&auth.fingerprint(), &request)
+        .await?;
+    if state
+        .db
+        .find(&auth.fingerprint(), &request.request_hash)
+        .await?
+        .is_some()
+    {
+        return Ok(RouteDecision::new(Mode::Batch, "existing_batch_job"));
+    }
+    Ok(state.policy.decide(body))
+}
+
+async fn explain_route(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<RouteDecision>, ProxyError> {
+    UpstreamAuth::from_headers(&headers)?;
+    Ok(Json(route(&state, &headers, &body).await?))
 }
 
 async fn direct_response(
@@ -92,15 +149,27 @@ async fn batch_response(
     body: Value,
 ) -> Result<Response, ProxyError> {
     let auth = UpstreamAuth::from_headers(headers)?;
-    let request = NormalizedRequest::from_body(&body, &state.config.upstream_base_url)?;
+    let request = NormalizedRequest::from_headers(&body, &state.config.upstream_base_url, headers)?;
     let job = state
         .db
-        .get_or_create(&auth.fingerprint(), &request.request_hash, &request.model)
+        .enqueue(&auth.fingerprint(), &state.provider, &request)
         .await?;
     let mut states = state
         .workers
         .subscribe(job.clone(), auth, request.batch_body)
         .await;
+    if body.get("stream").and_then(Value::as_bool) != Some(true) {
+        loop {
+            if let JobState::Terminal(outcome) = states.borrow_and_update().clone() {
+                let mut response = Json(jobs::response_value(&outcome, &job.id)).into_response();
+                set_batch_headers(&mut response, &job.id.0)?;
+                return Ok(response);
+            }
+            states.changed().await.map_err(|_| {
+                ProxyError::Internal("batch worker stopped before reaching a terminal state".into())
+            })?;
+        }
+    }
     let response_id = format!("resp_kaiion_{}", job.id);
     let heartbeat_period = state.config.in_progress_interval();
     let model = job.model.clone();
@@ -176,15 +245,19 @@ async fn batch_response(
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-transform"),
     );
+    set_batch_headers(&mut response, &job.id.0)?;
+    Ok(response)
+}
+
+fn set_batch_headers(response: &mut Response, job_id: &str) -> Result<(), ProxyError> {
     response
         .headers_mut()
         .insert("x-kaiion-mode", HeaderValue::from_static("batch"));
     response.headers_mut().insert(
         "x-kaiion-job-id",
-        HeaderValue::from_str(&job.id.0)
-            .map_err(|error| ProxyError::Internal(error.to_string()))?,
+        HeaderValue::from_str(job_id).map_err(|error| ProxyError::Internal(error.to_string()))?,
     );
-    Ok(response)
+    Ok(())
 }
 
 fn terminal_value(outcome: StoredOutcome) -> Value {

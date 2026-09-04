@@ -266,20 +266,21 @@ fn classify_status<T>(status: StatusCode, body: String) -> Result<T, ProviderErr
 }
 
 fn should_forward_request_header(name: &str) -> bool {
-    !matches!(
-        name,
-        "connection"
-            | "content-length"
-            | "content-type"
-            | "host"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "x-kaiion-mode"
-    )
+    !name.starts_with("x-kaiion-")
+        && !matches!(
+            name,
+            "connection"
+                | "content-length"
+                | "content-type"
+                | "host"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "x-kaiion-mode"
+        )
 }
 
 pub fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {

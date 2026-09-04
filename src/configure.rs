@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::config::Mode;
 use clap::ValueEnum;
 use serde_json::{Value, json};
 use toml_edit::{DocumentMut, Item, Table, value};
@@ -24,10 +25,20 @@ pub struct ConfigureOptions {
     pub proxy_url: String,
     pub model: String,
     pub direct_mode: bool,
+    pub client_mode: Option<Mode>,
+    pub session_id: Option<String>,
     pub dry_run: bool,
 }
 
 pub fn configure(options: &ConfigureOptions) -> Result<(), String> {
+    if options.session_id.as_ref().is_some_and(|value| {
+        value.trim().is_empty()
+            || value.len() > 256
+            || !value.is_ascii()
+            || value.bytes().any(|byte| byte.is_ascii_control())
+    }) {
+        return Err("session ID must contain 1 to 256 printable ASCII bytes".into());
+    }
     let all_clients = options.clients.is_empty() || options.clients.contains(&Client::All);
     if !all_clients && options.clients.contains(&Client::Claude) {
         return Err(
@@ -85,6 +96,19 @@ fn configure_codex(options: &ConfigureOptions) -> Result<(), String> {
     provider["wire_api"] = value("responses");
     provider["supports_websockets"] = value(false);
     provider["stream_idle_timeout_ms"] = value(300_000_i64);
+    if options.client_mode.is_some() || options.session_id.is_some() {
+        let headers = provider
+            .entry("http_headers")
+            .or_insert(Item::Table(Table::new()))
+            .as_table_mut()
+            .ok_or_else(|| "Codex http_headers must be a table".to_string())?;
+        if let Some(mode) = options.client_mode {
+            headers["x-kaiion-mode"] = value(mode.as_str());
+        }
+        if let Some(session) = &options.session_id {
+            headers["x-kaiion-session-id"] = value(session);
+        }
+    }
     write_text(&path, document.to_string(), options.dry_run)?;
     Ok(())
 }
@@ -129,12 +153,11 @@ fn configure_opencode(options: &ConfigureOptions) -> Result<(), String> {
             .ok_or_else(|| "OpenCode kaiion headers must be an object".to_string())?;
         headers.insert(
             "x-kaiion-mode".to_string(),
-            json!(if options.direct_mode {
-                "direct"
-            } else {
-                "batch"
-            }),
+            json!(client_mode(options).as_str()),
         );
+        if let Some(session) = &options.session_id {
+            headers.insert("x-kaiion-session-id".into(), json!(session));
+        }
         let models = kaiion_object
             .entry("models")
             .or_insert_with(|| json!({}))
@@ -193,14 +216,21 @@ fn configure_pi(options: &ConfigureOptions) -> Result<(), String> {
         .ok_or_else(|| "Pi kaiion headers must be an object".to_string())?;
     headers.insert(
         "x-kaiion-mode".to_string(),
-        json!(if options.direct_mode {
-            "direct"
-        } else {
-            "batch"
-        }),
+        json!(client_mode(options).as_str()),
     );
+    if let Some(session) = &options.session_id {
+        headers.insert("x-kaiion-session-id".into(), json!(session));
+    }
     providers.insert("kaiion".to_string(), provider);
     write_json(&path, &document, options.dry_run)
+}
+
+fn client_mode(options: &ConfigureOptions) -> Mode {
+    options.client_mode.unwrap_or(if options.direct_mode {
+        Mode::Direct
+    } else {
+        Mode::Batch
+    })
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -261,6 +291,8 @@ mod tests {
             codex_home: None,
             proxy_url: "http://127.0.0.1:8787/v1".to_string(),
             model: "gpt-test".to_string(),
+            client_mode: None,
+            session_id: None,
             direct_mode: false,
             dry_run: false,
         })
@@ -287,6 +319,8 @@ mod tests {
             codex_home: None,
             proxy_url: "http://127.0.0.1:8787/v1".to_string(),
             model: "gpt-test".to_string(),
+            client_mode: None,
+            session_id: None,
             direct_mode: true,
             dry_run: false,
         })

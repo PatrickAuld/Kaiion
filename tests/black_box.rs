@@ -1,3 +1,7 @@
+#[path = "scenarios/auto_routing.rs"]
+mod auto_routing;
+#[path = "scenarios/durable_jobs.rs"]
+mod durable_jobs;
 mod support;
 
 use std::time::Duration;
@@ -165,7 +169,7 @@ async fn batch_mode_validates_its_supported_request_contract() {
     );
 
     for (field, value, message) in [
-        ("stream", Value::Bool(false), "stream=true"),
+        ("stream", Value::String("true".into()), "boolean"),
         ("store", Value::Bool(true), "store=true"),
         (
             "previous_response_id",

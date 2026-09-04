@@ -19,6 +19,6 @@ cargo build --locked --all-features --bins
 KAIION_TEST_BINARY=target/debug/kaiion cargo test --locked --test black_box --all-features -- --test-threads=1
 ```
 
-Never persist API keys or raw authorization headers. Preserve direct-mode passthrough behavior. Do not introduce request pooling or an automatic routing mode without an explicit scope change.
+Never persist API keys or raw authorization headers. Preserve direct-mode passthrough behavior. Automatic cost routing and generic durable jobs are in scope. Keep routing policy separate from execution; unknown economics must favor batch, and auto retries must reconnect to an existing batch job. Request pooling remains unimplemented and requires explicit design and partial-failure coverage.
 
-Batch-mode request identity must remain scoped to the configured upstream provider and a stable Codex session/thread identifier. The MVP assumes one Kaiion process owns a SQLite database.
+Batch-mode request identity must remain scoped to the configured upstream provider and an explicit Idempotency-Key, X-Kaiion-Session-Id, or stable Codex session/thread identifier. The MVP assumes one Kaiion process owns a SQLite database.

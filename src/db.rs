@@ -15,7 +15,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Database {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
 }
 
 #[derive(Debug, Error)]
@@ -40,7 +40,7 @@ impl PersistenceError {
 }
 
 #[derive(Debug, FromRow)]
-struct RawJob {
+pub(crate) struct RawJob {
     id: String,
     model: String,
     status: String,

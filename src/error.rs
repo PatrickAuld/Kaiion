@@ -16,6 +16,12 @@ pub enum ProxyError {
     #[error("missing Authorization header")]
     Unauthorized,
 
+    #[error("job not found")]
+    NotFound,
+
+    #[error("{0}")]
+    Conflict(String),
+
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
 
@@ -40,6 +46,8 @@ impl ProxyError {
         match self {
             Self::BadRequest(_) => "invalid_request",
             Self::Unauthorized => "unauthorized",
+            Self::NotFound => "not_found",
+            Self::Conflict(_) => "conflict",
             Self::Transport(_) => "upstream_transport_error",
             Self::Persistence(_)
             | Self::Database(_)
@@ -53,6 +61,8 @@ impl ProxyError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Transport(_) => StatusCode::BAD_GATEWAY,
             Self::Persistence(_)
             | Self::Database(_)

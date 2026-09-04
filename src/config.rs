@@ -7,8 +7,12 @@ use crate::configure::{Client, ConfigureOptions};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 pub enum Mode {
+    #[serde(rename = "batch", alias = "Batch")]
     Batch,
+    #[serde(rename = "direct", alias = "Direct")]
     Direct,
+    #[serde(rename = "auto", alias = "Auto")]
+    Auto,
 }
 
 impl Mode {
@@ -16,6 +20,7 @@ impl Mode {
         match self {
             Self::Batch => "batch",
             Self::Direct => "direct",
+            Self::Auto => "auto",
         }
     }
 }
@@ -78,6 +83,14 @@ pub struct Config {
         default_value_t = 67_108_864
     )]
     pub max_body_bytes: usize,
+
+    #[arg(long, global = true, env = "KAIION_ROUTING_POLICY")]
+    #[serde(default)]
+    pub routing_policy: Option<PathBuf>,
+
+    #[arg(long, global = true, env = "KAIION_RESUME_FROM_ENV")]
+    #[serde(default)]
+    pub resume_from_env: bool,
 }
 
 impl Config {
@@ -90,7 +103,7 @@ impl Config {
     }
 
     pub fn to_args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "--listen".to_string(),
             self.listen.to_string(),
             "--database-url".to_string(),
@@ -105,7 +118,14 @@ impl Config {
             self.in_progress_interval_seconds.to_string(),
             "--max-body-bytes".to_string(),
             self.max_body_bytes.to_string(),
-        ]
+        ];
+        if let Some(path) = &self.routing_policy {
+            args.extend(["--routing-policy".to_string(), path.display().to_string()]);
+        }
+        if self.resume_from_env {
+            args.push("--resume-from-env".into());
+        }
+        args
     }
 }
 
@@ -164,6 +184,8 @@ pub enum Command {
     },
     #[command(about = "Configure supported coding agents to use Kaiion")]
     Configure(ConfigureCommand),
+    #[command(about = "Submit, inspect, and resume durable inference jobs")]
+    Jobs(crate::job_cli::JobsCommand),
 }
 
 #[derive(Debug, Args)]
@@ -191,6 +213,20 @@ pub struct ConfigureCommand {
         help = "Use batch mode for clients that provide Kaiion session metadata"
     )]
     pub batch: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with = "batch",
+        help = "Execution mode written to client headers"
+    )]
+    pub client_mode: Option<Mode>,
+
+    #[arg(
+        long,
+        help = "Stable workflow identity for clients without Codex metadata"
+    )]
+    pub session_id: Option<String>,
 
     #[arg(long, help = "Show changes without writing files")]
     pub dry_run: bool,
@@ -241,6 +277,8 @@ impl Cli {
             proxy_url,
             model: command.model.clone(),
             direct_mode: !command.batch,
+            client_mode: command.client_mode,
+            session_id: command.session_id.clone(),
             dry_run: command.dry_run,
         }
     }

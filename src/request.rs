@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use crate::{config::Mode, error::ProxyError};
 
 pub const MODE_HEADER: &str = "x-kaiion-mode";
+pub const SESSION_HEADER: &str = "x-kaiion-session-id";
+pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 #[derive(Clone, Debug)]
 pub struct UpstreamAuth {
@@ -51,10 +53,19 @@ pub struct NormalizedRequest {
     pub batch_body: Value,
     pub request_hash: String,
     pub model: String,
+    pub idempotency_hash: Option<String>,
 }
 
 impl NormalizedRequest {
     pub fn from_body(body: &Value, provider_namespace: &str) -> Result<Self, ProxyError> {
+        Self::from_headers(body, provider_namespace, &HeaderMap::new())
+    }
+
+    pub fn from_headers(
+        body: &Value,
+        provider_namespace: &str,
+        headers: &HeaderMap,
+    ) -> Result<Self, ProxyError> {
         let mut batch_body = body.clone();
         let object = batch_body.as_object_mut().ok_or_else(|| {
             ProxyError::BadRequest("Responses request must be a JSON object".to_string())
@@ -65,16 +76,18 @@ impl NormalizedRequest {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| ProxyError::BadRequest("missing model".to_string()))?
             .to_string();
-        let stream = object
+        if object
             .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !stream {
+            .is_some_and(|value| !value.is_boolean())
+        {
             return Err(ProxyError::BadRequest(
-                "batch mode requires stream=true".to_string(),
+                "stream must be a boolean".to_string(),
             ));
         }
-        if object.get("store").and_then(Value::as_bool) == Some(true) {
+        if object
+            .get("store")
+            .is_some_and(|value| value != &Value::Bool(false))
+        {
             return Err(ProxyError::BadRequest(
                 "batch mode does not support store=true".to_string(),
             ));
@@ -88,9 +101,26 @@ impl NormalizedRequest {
             ));
         }
 
-        let session_key = extract_session_key(object.get("client_metadata")).ok_or_else(|| {
+        if object
+            .get("conversation")
+            .is_some_and(|value| !value.is_null())
+            || object
+                .get("background")
+                .is_some_and(|value| value != &Value::Bool(false))
+        {
+            return Err(ProxyError::BadRequest(
+                "batch mode does not support conversation or background=true".into(),
+            ));
+        }
+
+        let session = identity_header(headers, SESSION_HEADER)?;
+        let idempotency = identity_header(headers, IDEMPOTENCY_HEADER)?;
+        let session_key = session.map(|value| format!("session-header:{value}"))
+            .or_else(|| extract_session_key(object.get("client_metadata")))
+            .or_else(|| idempotency.as_ref().map(|value| format!("idempotency:{value}")))
+            .ok_or_else(|| {
             ProxyError::BadRequest(
-                "batch mode requires client_metadata.thread_id or client_metadata.session_id for restart-safe request identity"
+                "batch mode requires Idempotency-Key, X-Kaiion-Session-Id, client_metadata.thread_id or client_metadata.session_id for restart-safe request identity"
                     .to_string(),
             )
         })?;
@@ -111,13 +141,24 @@ impl NormalizedRequest {
             &canonical_provider_url(provider_namespace)?,
         );
         hash_component(&mut hasher, b"session", &session_key);
+        let idempotency_hash = idempotency.map(|key| {
+            hash_component(&mut hasher, b"idempotency", &key);
+            let mut identity = hasher.clone();
+            hash_component(&mut identity, b"identity", "idempotency-v1");
+            hex_digest(identity.finalize())
+        });
         hash_bytes(&mut hasher, b"request", &encoded);
         let request_hash = hex_digest(hasher.finalize());
+        batch_body
+            .as_object_mut()
+            .expect("validated object")
+            .insert("store".into(), Value::Bool(false));
 
         Ok(Self {
             batch_body,
             request_hash,
             model,
+            idempotency_hash,
         })
     }
 }
@@ -143,10 +184,24 @@ pub fn resolve_mode(headers: &HeaderMap, default: Mode) -> Result<Mode, ProxyErr
     match value.to_str().unwrap_or_default() {
         "batch" => Ok(Mode::Batch),
         "direct" => Ok(Mode::Direct),
+        "auto" => Ok(Mode::Auto),
         value => Err(ProxyError::BadRequest(format!(
-            "invalid {MODE_HEADER} value {value:?}; expected batch or direct"
+            "invalid {MODE_HEADER} value {value:?}; expected batch, direct or auto"
         ))),
     }
+}
+
+pub fn identity_header(headers: &HeaderMap, name: &str) -> Result<Option<String>, ProxyError> {
+    let value = optional_header(headers, name)?;
+    if value
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty() || value.len() > 256)
+    {
+        return Err(ProxyError::BadRequest(format!(
+            "{name} must contain 1 to 256 non-blank bytes"
+        )));
+    }
+    Ok(value)
 }
 
 fn optional_header(headers: &HeaderMap, name: &str) -> Result<Option<String>, ProxyError> {
@@ -166,7 +221,13 @@ fn extract_session_key(client_metadata: Option<&Value>) -> Option<String> {
     let thread = metadata
         .get("thread_id")
         .and_then(Value::as_str)
-        .or_else(|| metadata.get("session_id").and_then(Value::as_str))?;
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            metadata
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })?;
     let turn = metadata
         .get("turn_id")
         .and_then(Value::as_str)

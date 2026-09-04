@@ -71,6 +71,8 @@ async fn start_at(
     let child = Command::new(executable)
         .arg("--foreground")
         .args(config.to_args())
+        .env_remove("KAIION_ROUTING_POLICY")
+        .env_remove("KAIION_RESUME_FROM_ENV")
         .env("KAIION_READY_FILE", &paths.ready_file)
         .current_dir(working_directory)
         .stdin(Stdio::null())

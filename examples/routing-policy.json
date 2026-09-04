@@ -1,0 +1,12 @@
+{
+  "max_direct_cost_usd": 0.001,
+  "max_direct_premium_usd": 0.0005,
+  "models": {
+    "example-model-replace-with-your-model": {
+      "input_usd_per_million": 1.0,
+      "output_usd_per_million": 4.0,
+      "batch_input_usd_per_million": 0.5,
+      "batch_output_usd_per_million": 2.0
+    }
+  }
+}
