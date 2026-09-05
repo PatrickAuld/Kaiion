@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Install Kaiiron, connect Codex, OpenCode, or Pi, and run non-urgent inference through the OpenAI Batch API. Configuration, routing, and recovery guide.">
+  <meta name="theme-color" content="#193ad0">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Get started with Kaiiron">
+  <meta property="og:description" content="Set up a local batch inference proxy for Codex, OpenCode, and Pi.">
+  <title>Get started — Kaiiron</title>
+  <link rel="stylesheet" href="../styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="wordmark" href="../" aria-label="Kaiiron home">kaiiron<span aria-hidden="true">.</span></a>
+    <nav aria-label="Main navigation"><a href="../#how-it-works">How it works</a><a href="./" aria-current="page">Docs</a><a href="https://github.com/PatrickAuld/Kaiion">GitHub <span aria-hidden="true">↗</span></a></nav>
+  </header>
+  <main id="main" class="wrap">
+    <div class="docs-intro"><p class="eyebrow">KAIIRON · GETTING STARTED</p><h1>Run your first batch-backed task.</h1><p>Start with one small, non-urgent task. This guide covers installation, client setup, and the boundaries of inference recovery.</p></div>
+    <div class="docs-layout">
+      <nav class="docs-nav" aria-label="Documentation sections">
+        <a href="#quickstart">Quickstart</a><a href="#clients">Client setup</a><a href="#modes">Routing modes</a><a href="#jobs">Detached jobs</a><a href="#recovery">Recovery &amp; limits</a><a href="#operations">Local operations</a><a href="#reference">Full reference</a>
+      </nav>
+      <div class="prose">
+        <section id="quickstart" aria-labelledby="quickstart-title">
+          <h2 id="quickstart-title">Quickstart</h2>
+          <p>You need a current stable Rust toolchain with Cargo, Git, a supported coding client, and an OpenAI Platform API key. Choose a model available to your API project that supports both Responses and Batch. See the <a href="https://developers.openai.com/api/docs/models">OpenAI model reference</a>.</p>
+          <p>The setup below uses Bash or Zsh on macOS or Linux. Kaiiron is currently distributed as source.</p>
+          <h3>1. Install and start Kaiiron</h3>
+          <pre tabindex="0" aria-label="Install and start commands"><code>git clone https://github.com/PatrickAuld/Kaiion.git
+cd Kaiion
+cargo install --path . --locked
+kaiiron --mode batch start
+kaiiron status</code></pre>
+          <p>The proxy listens on <code>http://127.0.0.1:8787</code>. Make sure Cargo’s binary directory is on your <code>PATH</code>. If Kaiiron is already running, stop it before starting it with a different mode.</p>
+          <h3>2. Connect Codex</h3>
+          <pre tabindex="0" aria-label="Configure Codex"><code>kaiiron configure --client codex</code></pre>
+          <p>This selects Kaiiron as Codex’s provider and updates its Responses transport settings while preserving unrelated configuration. It keeps your configured Codex model. To inspect which files would be updated first, add <code>--dry-run</code>.</p>
+          <h3>3. Supply credentials and run a small task</h3>
+          <p>Set <code>OPENAI_API_KEY</code> in the shell that launches your client, using your normal secret-management process. In the following command, replace <code>YOUR_BATCH_SUPPORTED_MODEL</code> with your model ID. Run it from a repository you want the agent to inspect.</p>
+          <pre tabindex="0" aria-label="Run a bounded Codex task"><code>codex exec --sandbox read-only \
+  --model YOUR_BATCH_SUPPORTED_MODEL \
+  "Read the README and suggest three documentation improvements. Do not edit files."</code></pre>
+          <p>Keep the client running while it waits. Kaiiron sends progress events during batch processing and returns the completed response. This is billed API inference, separate from a ChatGPT subscription.</p>
+          <div class="callout"><p><strong>Plan for provider latency.</strong> OpenAI batches have a 24-hour completion window; unfinished work can expire. A tool-using agent can need several dependent inference calls, each with its own wait. Client timeouts still apply. There is no overnight completion guarantee.</p></div>
+        </section>
+
+        <section id="clients" aria-labelledby="clients-title">
+          <h2 id="clients-title">Client setup</h2>
+          <p>All three integrations use OpenAI Responses. Configuration does not install the client itself. The following versions are pinned in Kaiiron’s real-client CI tests, which use a mock provider; other releases and live-provider behavior may differ.</p>
+          <div class="mode-table" role="region" aria-label="Tested client versions" tabindex="0">
+            <table><thead><tr><th scope="col">Client</th><th scope="col">Tested version</th><th scope="col">Default route after configure</th></tr></thead><tbody>
+              <tr><th scope="row">Codex</th><td>0.104.0</td><td>Proxy default; batch on a fresh start</td></tr>
+              <tr><th scope="row">OpenCode</th><td>1.18.28</td><td>Direct</td></tr>
+              <tr><th scope="row">Pi</th><td>0.85.0</td><td>Direct</td></tr>
+            </tbody></table>
+          </div>
+          <h3>OpenCode</h3>
+          <p>Choose a model ID and a workflow ID. Replace <code>YOUR_BATCH_SUPPORTED_MODEL</code> in both commands.</p>
+          <pre tabindex="0" aria-label="OpenCode batch configuration"><code>kaiiron configure --client opencode \
+  --model YOUR_BATCH_SUPPORTED_MODEL \
+  --client-mode batch --session-id docs-review-001
+opencode --model kaiion/YOUR_BATCH_SUPPORTED_MODEL</code></pre>
+          <h3>Pi</h3>
+          <pre tabindex="0" aria-label="Pi batch configuration"><code>kaiiron configure --client pi \
+  --model YOUR_BATCH_SUPPORTED_MODEL \
+  --client-mode batch --session-id docs-review-002
+pi --provider kaiion --model YOUR_BATCH_SUPPORTED_MODEL</code></pre>
+          <p>Keep the session ID stable across retries of the same workflow. Configure a new ID for a new workflow. A static session header cannot distinguish an intentional, identical inference from a retry. Custom adapters should send a unique <code>Idempotency-Key</code> per intended inference and reuse it only for that inference’s retries.</p>
+          <p>Codex normally supplies its own stable session metadata. Explicit <code>--client-mode</code> and <code>--session-id</code> options are also available for Codex and take precedence when set. Existing explicit mode headers remain until changed; use <code>--client-mode batch</code> to replace a prior direct override.</p>
+          <h3>Claude Code</h3>
+          <p>Not supported in this release. Claude Code requires Anthropic Messages, and Kaiiron currently exposes OpenAI Responses. <code>kaiiron configure --client claude</code> rejects configuration instead of writing an incompatible endpoint.</p>
+        </section>
+
+        <section id="modes" aria-labelledby="modes-title">
+          <h2 id="modes-title">Routing modes</h2>
+          <p><strong>Batch</strong> submits each inference as a one-entry provider batch. <strong>Direct</strong> passes the request through immediately. <strong>Auto</strong> chooses using a deterministic policy with your model prices, a maximum estimated direct cost, and a maximum estimated premium for avoiding the wait.</p>
+          <p>To enable auto, first copy and edit the <a href="https://github.com/PatrickAuld/Kaiion/blob/main/examples/routing-policy.json">example policy</a> with your model IDs and current provider rates. Its prices are illustrative. Then restart the service with an absolute path to your policy:</p>
+          <pre tabindex="0" aria-label="Enable auto routing"><code>kaiiron stop
+kaiiron --mode auto \
+  --routing-policy /absolute/path/routing-policy.json start
+kaiiron jobs route --request examples/response-request.json</code></pre>
+          <p>The last command runs from the cloned repository and explains the route without calling the inference provider. To route OpenCode or Pi through auto, repeat that client’s configuration with <code>--client-mode auto</code> and a stable session ID. Explicit client headers override the proxy default.</p>
+          <p>Unknown model prices, missing output limits, substantial reasoning settings, and unpriced modalities or hosted tools favor batch. With no policy file, auto selects batch. The policy loads on startup; restart to reload it.</p>
+          <p>Limits are per-call estimates, not cumulative budgets or billing guarantees. Direct calls—including auto-selected direct calls—do not have durable batch replay semantics. Existing batch jobs stay on batch when replayed through auto.</p>
+        </section>
+
+        <section id="jobs" aria-labelledby="jobs-title">
+          <h2 id="jobs-title">Detached inference jobs</h2>
+          <p>Use the job API when your caller should submit inference and return immediately. Set <code>OPENAI_API_KEY</code>, edit the example request’s model and input, and run these commands from the cloned repository:</p>
+          <pre tabindex="0" aria-label="Submit and inspect detached jobs"><code>kaiiron jobs submit \
+  --request examples/response-request.json \
+  --idempotency-key workflow-42/step-1
+kaiiron jobs list
+kaiiron jobs show JOB_ID
+kaiiron jobs wait JOB_ID</code></pre>
+          <p>Replace <code>JOB_ID</code> with the submitted job’s ID. <code>wait</code> reattaches credentials, polls, and prints the stored response. Interrupting it leaves the inference running while the proxy stays up. Detached jobs always use batch, regardless of the proxy’s default mode.</p>
+          <p>After a proxy restart, use <code>kaiiron jobs resume JOB_ID</code> or <code>wait</code> to restart polling. The optional <code>--resume-from-env</code> service flag resumes matching jobs using <code>OPENAI_API_KEY</code> and any matching organization/project variables.</p>
+          <p>These are inference jobs. Your harness remains responsible for saving tool results, workspace state, and the next step in an agent workflow.</p>
+        </section>
+
+        <section id="recovery" aria-labelledby="recovery-title">
+          <h2 id="recovery-title">Recovery and release limits</h2>
+          <p>Kaiiron persists batch request bodies, upstream job IDs, and terminal results in SQLite. When a client reissues the same identified request with matching credentials, Kaiiron reconnects to its pending batch or replays its stored result.</p>
+          <ul>
+            <li><strong>No automatic agent restoration.</strong> Stock Codex does not resend an interrupted inference merely because <code>codex resume</code> starts. An agent continuation adapter or an explicit request replay is required.</li>
+            <li><strong>Credentials are not stored.</strong> Resumption requires the original API key, organization, project, and upstream provider. Key rotation across existing jobs is not yet supported.</li>
+            <li><strong>Uncertain submissions stay explicit.</strong> If the provider may have accepted a batch but its create response was lost, Kaiiron reconciles provider metadata. It does not blindly create another potentially billable batch.</li>
+            <li><strong>Batch requests need full history and stable identity.</strong> Use an idempotency key, session header, or supported client metadata. Batch mode rejects <code>store: true</code>, <code>previous_response_id</code>, <code>conversation</code>, and <code>background: true</code>.</li>
+            <li><strong>One process per database.</strong> Request pooling, native Anthropic and Chat Completions adapters, workflow supervision, and hard cumulative budgets are not included.</li>
+          </ul>
+          <p>For the detailed contract and upcoming work, read the <a href="https://github.com/PatrickAuld/Kaiion/blob/main/docs/long-horizon-workflows.md">architecture and roadmap</a>.</p>
+        </section>
+
+        <section id="operations" aria-labelledby="operations-title">
+          <h2 id="operations-title">Local operations</h2>
+          <pre tabindex="0" aria-label="Manage the local service"><code>kaiiron status
+kaiiron logs --lines 100
+kaiiron restart
+kaiiron stop</code></pre>
+          <p><code>restart</code> reuses the saved service configuration and working directory. For a different configuration, stop the service and start it with the new options.</p>
+          <p>Configuration lives in <code>~/.config/kaiion</code>; the database and service state live in <code>~/.local/state/kaiion</code>. Kaiiron honors <code>XDG_CONFIG_HOME</code> and <code>XDG_STATE_HOME</code>. The <code>kaiion</code> and <code>kaiiron</code> binaries are equivalent; existing directory names and <code>KAIION_*</code> environment variables retain their original spelling.</p>
+          <h3>If your first request fails</h3>
+          <ul>
+            <li>Confirm the proxy is healthy with <code>kaiiron status</code> and inspect <code>kaiiron logs --lines 100</code>.</li>
+            <li>Confirm the client shell has the API key and the selected model is available to your project through Batch.</li>
+            <li>For HTTP 400, check full-history requirements and stable session identity. For HTTP 409, check whether an idempotency key was reused with a different payload.</li>
+            <li>For an interrupted agent, consult the recovery contract above before attempting another request.</li>
+          </ul>
+        </section>
+
+        <section id="reference" aria-labelledby="reference-title">
+          <h2 id="reference-title">Full reference</h2>
+          <p>The <a href="https://github.com/PatrickAuld/Kaiion#readme">repository README</a> documents the complete API, environment variables, authentication boundaries, and test commands. <a href="https://github.com/PatrickAuld/Kaiion/issues">Report a reproducible issue</a> with your client version and relevant logs after removing credentials and private request content.</p>
+        </section>
+      </div>
+    </div>
+  </main>
+  <footer class="site-footer wrap"><a class="wordmark" href="../">kaiiron<span aria-hidden="true">.</span></a><p>More room for work that matters.</p><nav aria-label="Footer navigation"><a href="../">Home</a><a href="https://github.com/PatrickAuld/Kaiion">Source</a><a href="https://github.com/PatrickAuld/Kaiion/blob/main/LICENSE">MIT license</a></nav></footer>
+</body>
+</html>

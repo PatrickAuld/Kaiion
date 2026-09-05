@@ -1,5 +1,7 @@
 # Kaiion
 
+**[Kaiiron website](https://patrickauld.github.io/Kaiion/) · [Getting started](https://patrickauld.github.io/Kaiion/docs/)**
+
 Kaiion is a durable inference proxy for existing agent harnesses. It serves OpenAI Responses over SSE or JSON, turns latency-insensitive inference into Batch API jobs, and exposes detached jobs for workflows that outlive their client process.
 
 See [the architecture evaluation and implementation roadmap](docs/long-horizon-workflows.md) for the product direction, routing model, and remaining limitations.
