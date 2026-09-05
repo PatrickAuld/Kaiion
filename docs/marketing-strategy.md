@@ -4,20 +4,22 @@ Prepared 2026-09-05 against repository commit `00ce1dc`. This is a reasoned laun
 
 ## Positioning decision
 
-**Keep your agent. Spend less on inference.**
+**Put agents to work on bigger things.**
 
-Kaiiron is an open-source local inference proxy for developers who already use coding agents and have valuable work with flexible deadlines. It connects supported clients to OpenAI Batch, with durable inference state and explicit routing controls.
+Kaiiron makes long-horizon agent work more economical, so developers can delegate deeper investigations, broader changes, and more of their backlog. Its current implementation is an open-source local inference proxy connecting existing clients to OpenAI Batch, with durable inference state and explicit routing controls.
 
-The useful market wedge is access to cheaper inference through an existing workflow. The user should not need to adopt another general-purpose agent system to try it. Lead with that practical change; explain durability as evidence that waiting can be manageable. Avoid selling the future multi-day workflow architecture as a present capability.
+The primary selling point is expanding what people can afford to ask agents to do. Long-horizon work involves repeated investigation, action, verification, and reasoning; lowering the cost of those steps can make more ambitious tasks worthwhile. Batch pricing is the enabling mechanism and evidence for this promise. Existing-client compatibility makes the change accessible.
 
-The underlying customer value is **making more useful work economical**. A discount only matters if a developer can finish a task they would otherwise postpone, reduce, or avoid. The site therefore connects the mechanism to repository maintenance, broad code analysis, and repeatable evaluations, then offers a bounded first run.
+The underlying customer value is **a larger practical scope for delegation**: go deeper on a problem, cover more of a codebase, and use agents on work that would otherwise stay in the backlog. Evaluate success by the work newly attempted and completed, as well as its cost. The page leads with these outcomes, followed by economics and implementation proof. A bounded first run remains the adoption path into that larger ambition.
+
+This positioning describes the economic foundation for long-horizon agents. It does not claim that Kaiiron itself plans tasks, supervises agents, schedules recurring work, restores tool state, or guarantees unattended completion over days. The harness owns those capabilities; current recovery boundaries remain explicit in the page and setup guide.
 
 ## Customer evaluation
 
 | Priority | Segment and decision maker | Job to be done | Why Kaiiron could win | Main barrier | Recommended first offer |
 |---|---|---|---|---|---|
-| 1 | Individual developers and small engineering teams; developer pays or controls API spend | Run non-urgent maintenance or analysis using an existing Codex, OpenCode, or Pi setup | Low migration effort, explicit API economics, local ownership | Batch waits, source installation, client timeouts, separate API billing | One small read-only repository task with an exact setup guide |
-| 2 | Agent tooling and developer infrastructure builders; technical lead owns integration | Add asynchronous inference and retrieve it after a caller disconnects | Durable job API, reusable Responses contract, inspectable routing | Must own tool-state checkpoints and continuation; no shared-database scaling | A detached inference example and documented recovery contract |
+| 1 | Developers and small engineering teams already delegating work to agents; developer pays or controls API spend | Expand from small tasks into deeper investigations, broader migrations, and more backlog work | More economical repeated reasoning without changing the agent or model | Batch waits, source installation, client timeouts, separate API billing | One bounded step from a larger real project, followed by a measured expansion |
+| 2 | Long-horizon agent and developer infrastructure builders; technical lead owns integration | Make sustained agent workflows economically viable while owning their continuation | Durable job API, reusable Responses contract, inspectable routing | Must own tool-state checkpoints and continuation; no shared-database scaling | A detached inference example and documented recovery contract |
 | 3 | Evaluation/research practitioners already using Responses-based harnesses | Run independent inference across a repeatable workload | CLI plus stored results without writing submission/polling from scratch | Native Batch is a strong alternative; one-entry batches limit throughput efficiency | A small evaluation pilot using the job API, with provider receipts |
 | Later | Enterprise platform and FinOps buyers | Govern large agent fleets and cumulative spend | Potential future reuse across harnesses | No hard workflow budgets, central fleet management, rotation across jobs, or proven enterprise scale | Defer broad enterprise claims until the product supplies evidence |
 
@@ -27,13 +29,14 @@ Do not spend launch effort targeting people who need interactive latency, users 
 
 | Value to the customer | Site message | Available evidence | Claim boundary |
 |---|---|---|---|
-| More work per inference budget | Give flexible work a different price | OpenAI documents a 50% Batch discount against synchronous pricing | Token pricing for eligible models; not a measured 50% reduction in total workflow cost |
+| Expand the work worth delegating | Put agents to work on bigger things | Lower eligible inference rates provide an economic basis for repeated reasoning | A value hypothesis to validate with completed customer work; no guaranteed increase in quality, capacity, or autonomy |
+| Make repeated reasoning more affordable | Lower the cost of taking the next step | OpenAI documents a 50% Batch discount against synchronous pricing | Token pricing for eligible models; not a measured 50% reduction in total workflow cost |
 | Preserve investment in tools and habits | Keep your agent | Configure implementation plus real Codex, OpenCode, and Pi CLI tests in CI | Responses integrations and pinned versions; not every harness, release, or endpoint |
 | Avoid losing track of paid inference | Keep inference recoverable | Durable SQLite state, replay, detached jobs, ambiguous-create reconciliation | Does not restore tool execution, workspace state, or a stopped agent process |
 | Deliberate control over latency costs | Choose when to wait | Batch/direct/auto with explicit per-call price policy and route explanation | Estimates, not cumulative reservations or billing guarantees |
 | Own the deployment | Your API key. Your machine. | Rust binary, local SQLite, MIT license, credentials not persisted | Prompts and results still go to the configured inference provider and persist locally |
 
-Product principles implied by this positioning: continuity with existing tools; economical use of flexible time; user control; honest recovery semantics. Keep these visible through the product and documentation rather than adding a generic values page.
+Product principles implied by this positioning: enable ambition; make sustained agent use accessible; preserve existing tools and user control; state recovery semantics honestly. Keep these visible through the product and documentation rather than adding a generic values page.
 
 ## Alternatives and differentiation
 
@@ -46,12 +49,13 @@ Do not claim uniqueness, best-in-class reliability, universal compatibility, mar
 
 ## Messaging and conversion
 
-- **Category:** Batch inference for coding agents.
-- **Headline:** Keep your agent. Spend less on inference.
-- **Explanation:** Some work can wait. Kaiiron connects the coding agents you already use to OpenAI's Batch API, so your non-urgent work can run at lower inference rates.
+- **Category:** Economical inference for long-horizon agents.
+- **Headline:** Put agents to work on bigger things.
+- **Explanation:** Deeper investigations. Broader migrations. More of the backlog. Kaiiron makes work that takes many rounds of reasoning more economical, so you can give your existing agents more to do.
+- **Value sequence:** Larger practical scope for delegation → more sustained agent use → lower cost of repeated inference → batch, routing, and recovery as supporting mechanisms.
 - **Primary action:** Get started → client-specific setup → a small successful batch-backed task.
 - **Secondary action:** Explore the source, for technical evaluation and trust.
-- **Proof order:** provider economics and wait tradeoff; recognizable work; concrete implementation; verified compatibility; operational boundaries.
+- **Proof order:** ambitious but recognizable work; provider economics and wait tradeoff; concrete implementation; verified compatibility; operational boundaries.
 
 The page deliberately has no pricing tiers, sales form, fabricated testimonials, customer logos, vanity adoption counts, or unverified savings calculator. It is a self-hosted open-source tool with a developer-led adoption path. A white/navy layout, one blue accent, strong typography, and source-level examples suit that decision. Plain HTML/CSS keeps maintenance and delivery simple.
 
@@ -63,7 +67,7 @@ Use **Kaiiron** in marketing and the `kaiiron` command in examples. Preserve the
 
 Recruit a small handful of developers already paying for supported API inference. Ask each to bring a real maintenance or code-analysis task with a flexible deadline. Start with read-only output and a bounded scope; a client-backed run still needs to stay alive. Work with them until they can explain both the value and the limitations without help.
 
-Collect: previous workflow, eligible spend, acceptable wait, model/client version, installation friction, time to first completed inference, useful output, provider charges, errors, and willingness to repeat. Ask what would have prevented the task from happening without Kaiiron. Do not assume every completed trial represents demand.
+Collect: previous workflow, eligible spend, acceptable wait, model/client version, installation friction, time to first completed inference, useful output, provider charges, errors, and willingness to repeat. Ask which task was previously too expensive to delegate, which additional steps became worthwhile, and whether they would now use agents more often. Separate genuinely new work from existing work made cheaper. Do not assume every completed trial represents demand.
 
 ### Then: publish evidence through existing communities
 
@@ -77,13 +81,13 @@ If developers return for another workflow, turn their strongest task into a case
 
 ## Success criteria and measurements
 
-The primary outcome is **useful completed workflows per dollar**, with human setup/recovery effort reported alongside it. Page views, stars, and downloads are acquisition signals, not proof of value.
+The primary outcome is **more useful work delegated and completed**: tasks previously left undone, broader task scope, and repeat agent use. Track **useful completed workflows per dollar**, reasoning steps, wall time, and human setup/recovery effort alongside it. Longer runs are valuable only when they produce useful outcomes; maximizing tokens or agent runtime is not the objective. Page views, stars, and downloads are acquisition signals, not proof of value.
 
 | Stage | Measurement | Decision it informs |
 |---|---|---|
 | Interest | Qualified developers proceeding to the setup guide; which use case brought them | Whether positioning attracts the intended user |
 | Activation | First successful batch-backed task; elapsed setup time; failures by client/version | Whether adoption is feasible without live assistance |
-| Value | Useful output, provider-reported charges, eligible batch share, wall time | Whether flexible-time economics justify the wait |
+| Value | Newly attempted and completed work, scope relative to prior tasks, useful output, provider-reported charges, wall time | Whether better economics actually expand worthwhile delegation |
 | Reliability | Finished/incomplete tasks, recovery success, uncertain submissions, manual interventions | Whether a broader launch would set expectations the product can meet |
 | Retention | A second independent workflow within two weeks, with the reason for using or abandoning it | Whether there is recurring value |
 
