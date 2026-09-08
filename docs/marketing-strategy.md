@@ -1,14 +1,14 @@
 # Kaiiron marketing strategy
 
-Revised 2026-09-05 to reflect the product owner's direction: market to nontechnical users of agents. The audience choice is a strategic direction, not a measured claim about current market demographics. Customer motivations and launch priorities below are hypotheses to validate. Technical capability claims remain grounded in the implementation and sources listed below.
+Revised 2026-09-08 to reflect the product owner's direction: sell ambitious project delegation, longer runs, and affordable scale to nontechnical users of agents. The audience choice is a strategic direction, not a measured claim about current market demographics. Customer motivations and launch priorities below are hypotheses to validate. Technical capability claims remain grounded in the implementation and sources listed below.
 
 ## Positioning
 
-**Put agents to work on bigger things.**
+**Stop managing tasks. Start delegating projects.**
 
-Kaiiron makes longer AI tasks more affordable, so people can give their existing agents more of the work worth doing.
+Kaiiron makes longer agent runs more affordable, giving people room to delegate whole projects, pursue more alternatives, and put more agents to work on ambitious goals.
 
-The customer wants an idea explored, a decision researched, or a project moved forward. They do not need to understand how AI requests are submitted or stored to understand that value. Lead with what becomes worth doing, explain the tradeoff in everyday language, and offer a clear next step.
+The customer wants to stop being the bottleneck between every small task. They want to set a worthwhile destination, give agents time to pursue it, and spend their own attention on decisions. Lead with that change in how they work. Make affordable longer runs the reason bigger asks become practical. Technical simplicity alone is not a selling point; replacing jargon with generic phrases such as “explore an idea” loses the ambition.
 
 Long-horizon agents remain the product thesis. Translate that into the customer's experience: work that takes more than one answer, involves several steps, and may take time. The value is a larger practical scope for delegation, including more thorough work and more frequent use. Lower processing costs support that outcome.
 
@@ -33,27 +33,37 @@ The current release requires technical installation. This limits immediate adopt
 
 | Customer value | Plain-language expression | Supporting basis | Boundary |
 |---|---|---|---|
-| More possibilities within reach | Put agents to work on bigger things | Lower eligible processing rates can make previously uneconomical tasks worthwhile | Validate with actual new work attempted and completed |
-| More thorough work | Some worthwhile work takes more than one answer | A lower cost per inference can support additional steps | More time or more steps does not guarantee a better result |
-| More frequent use | Give your agent more of the work worth doing | Better task economics can lower the threshold for delegation | Do not promise a fixed number of extra tasks or unlimited use |
+| More possibilities within reach | Stop managing tasks. Start delegating projects. | Lower eligible processing rates can make previously uneconomical tasks worthwhile | Validate with actual new work attempted and completed |
+| More thorough work | Give big asks the time they deserve | A lower cost per inference can support additional steps | More time or more steps does not guarantee a better result |
+| More frequent use | More agents. Longer runs. Bigger asks. | Better task economics can lower the threshold for delegation | Do not promise a fixed number of extra tasks or unlimited use |
 | Familiarity and control | Keep the agent you know | Codex, OpenCode, and Pi integrations exist | Version and setup details belong in the guide |
-| An understandable tradeoff | When the work can wait, your budget can go further | OpenAI offers discounted asynchronous processing | Savings vary; work takes longer; completion time is not guaranteed |
+| Affordable ambition | Shoot big. Don’t spend big. | OpenAI offers discounted asynchronous processing | Savings vary; work takes longer; completion time is not guaranteed |
 
 Principles: make ambition accessible, respect the reader's time, preserve their control, and state material limitations plainly. The page should let someone decide whether the idea suits their work without learning the implementation.
 
 ## Public messaging
 
-- **Headline:** Put agents to work on bigger things.
-- **Supporting copy:** Explore an idea. Research a decision. Work through a bigger project. Kaiiron makes longer AI tasks more affordable, so you can give your agent more of the work worth doing.
-- **Examples:** Understand your options; develop an idea; move a project forward.
-- **Economic explanation:** Kaiiron helps your agent use lower-priced AI processing for work that does not need an immediate answer.
-- **Primary action:** Get started → plain-language setup expectations → technical guide for the user or their helper.
-- **Secondary action:** See what's possible → recognizable uses on the page.
-- **Message order:** Desired outcome; familiar examples; affordability and waiting; how the person uses it; practical questions; next step.
+- **Headline:** Stop managing tasks. Start delegating projects.
+- **Supporting copy:** Give your agents ambitious goals and the time to pursue them. Kaiiron makes longer runs more affordable, so more of the projects you’ve been putting off become worth taking on.
+- **Time:** Give big asks the time they deserve.
+- **Economics:** Shoot big. Don’t spend big.
+- **Attention:** Why spend your evening switching between agents?
+- **Scale:** More agents. Longer runs. Bigger asks.
+- **Primary action:** Get started → practical setup expectations → technical guide for the user or their helper.
+- **Secondary action:** Think bigger → examples of project-sized asks.
+- **Message order:** A change in how the customer works; ambitious asks; affordable scale; overnight delegation habits; practical questions; start with the postponed project.
 
-GitHub is available in the footer for readers who want the project. Source code is not the primary or secondary sales action. The technical guide is explicitly labeled and retains accurate installation instructions and operational limits.
+Use complete asks rather than generic categories: “Compare these proposals and recommend a plan,” “Develop three ways to launch this idea,” and “Turn these scattered materials into a complete guide.” Show an outcome someone can hand over and judge. The chosen agent must supply the tools to carry out each project.
 
-The landing page does not need a numerical discount to establish the promise. A broad percentage next to consumer benefits can be mistaken for a reduction in the whole bill. Explain lower processing rates in plain language and keep provider-specific pricing detail in the technical reference. Do not invent pricing plans, a waitlist, customer logos, testimonials, measured savings, or a managed product.
+“Stop managing tasks” expresses the delegation approach: define the project and reserve attention for judgment. Kaiiron currently supplies more economical inference, not full task supervision. The page attributes project execution to the user's existing agent and explains that it can still require input or approval.
+
+Overnight is a useful way to frame flexible time, not a completion deadline. “Give it the night” and “Review progress when you return” fit the current product better than a promise of finished projects every morning. Avoid claiming unlimited runtime or that interrupted agents automatically restore themselves.
+
+The owner's five-agents-to-twenty example identifies the desired value: more agent work for the same budget with less context switching. Do not publish that numerical comparison as a measured capability. It implies four times the work per dollar, which does not follow from a 50% provider processing discount. A defensible comparison needs matched work, actual bills, completion results, and a defined time window. Until measured, express the value through affordable scale without inventing a multiplier.
+
+GitHub is available in the footer for readers who want the project. Source code is not the primary or secondary sales action. The technical guide retains accurate installation instructions and operational limits.
+
+Do not invent pricing plans, a waitlist, customer logos, testimonials, measured savings, or a managed product. “Shoot big. Don’t spend big.” is supported by an explanation of lower-priced AI work and a short statement that savings vary; it is not a hard budget guarantee.
 
 ## Editorial rules
 
@@ -61,7 +71,7 @@ Write for an intelligent person who uses an agent but has no interest in its imp
 
 Keep the landing page free of commands, source-install instructions, database names, protocol names, request identities, token accounting, routing tables, transport behavior, job APIs, test matrices, and recovery contracts. Keep those details in the technical guide and repository.
 
-Use ordinary task language: compare proposals, work through background reading, shape a plan, refine a draft, organize notes, update materials. Avoid assuming the reader has a repository, knows what a migration is, or thinks in terms of inference budgets.
+Use direct, memorable language about ambition, attention, time, and money. Every section should give the reader a reason to change what they delegate. Show whole outcomes and meaningful choices, not a list of minor assistant chores. Avoid assuming the reader has a repository, knows what a migration is, or thinks in terms of inference budgets. Keep the claims precise without draining the headline of its point.
 
 Retain facts that change the visitor's decision, stated simply:
 
@@ -86,7 +96,7 @@ For technical evaluators, native OpenAI Batch offers the same advertised process
 Show the page to nontechnical people who already use agents, including those whose setup is managed by someone else. Without explaining the product first, ask:
 
 1. What would Kaiiron help you do?
-2. Which task of yours would you try?
+2. Which project would you now consider delegating, and what would you let the agent do before checking in?
 3. What would you expect to pay for, and how quickly would you expect the result?
 4. What do you think you need to get started?
 
@@ -115,7 +125,7 @@ Primary outcome: **more useful work delegated and completed**. Track tasks previ
 | Stage | Measurement | Decision |
 |---|---|---|
 | Comprehension | Can a nontechnical reader explain the value, wait, charges, and setup requirement? | Does the page communicate the product accurately? |
-| Relevance | Can the person name a real task they would hand over? | Do the examples connect to actual work? |
+| Relevance | Can the person name a whole project they would hand over, with its desired outcome? | Does the message expand their ambition beyond small tasks? |
 | Activation | A useful first result; amount of setup help and time required | Can the intended audience actually adopt the release? |
 | Value | Newly attempted and completed work, actual AI charges, waiting time, usefulness | Does affordability expand worthwhile delegation? |
 | Retention | A second independent task within two weeks, and why they returned or stopped | Is there recurring value? |
