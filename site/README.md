@@ -4,6 +4,8 @@ Plain HTML and CSS, served directly by GitHub Pages. No build step, JavaScript, 
 
 - `index.html`: nontechnical marketing, recognizable outcomes, plain-language cost/time expectations, and a setup entry point.
 - `docs/index.html`: explicitly labeled technical setup guide and operational reference, for the user or someone helping them install.
+- `plan/index.html`: the scheduling plan, with shipped behavior, composed rules, limits, and the roadmap.
+- `plan/plan.css`: styles for the plan page, layered on the shared responsive stylesheet.
 - `styles.css`: shared responsive design and accessibility styles.
 - `../docs/marketing-strategy.md`: customer evaluation, positioning rationale, evidence, and launch plan.
 

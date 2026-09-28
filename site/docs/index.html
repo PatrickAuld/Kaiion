@@ -15,7 +15,7 @@
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="site-header wrap">
     <a class="wordmark" href="../" aria-label="Kaiiron home">kaiiron<span aria-hidden="true">.</span></a>
-    <nav aria-label="Main navigation"><a href="../">About Kaiiron</a><a href="./" aria-current="page">Setup guide</a><a href="https://github.com/PatrickAuld/Kaiion">GitHub <span aria-hidden="true">↗</span></a></nav>
+    <nav aria-label="Main navigation"><a href="../">About Kaiiron</a><a href="../plan/">Scheduling plan</a><a href="./" aria-current="page">Setup guide</a><a href="https://github.com/PatrickAuld/Kaiion">GitHub <span aria-hidden="true">↗</span></a></nav>
   </header>
   <main id="main" class="wrap">
     <div class="docs-intro"><p class="eyebrow">KAIIRON · TECHNICAL SETUP GUIDE</p><h1>Connect your agent to Kaiiron.</h1><p>Kaiiron’s early release requires technical setup. This guide is for you or someone helping you install it. You’ll need a supported agent and a separately billed OpenAI account for AI usage. Start with a small task that can wait.</p></div>
@@ -85,6 +85,8 @@ kaiiron jobs route --request examples/response-request.json</code></pre>
           <p>The last command runs from the cloned repository and explains the route without calling the inference provider. To route OpenCode or Pi through auto, repeat that client’s configuration with <code>--client-mode auto</code> and a stable session ID. Explicit client headers override the proxy default.</p>
           <p>Unknown model prices, missing output limits, substantial reasoning settings, and unpriced modalities or hosted tools favor batch. With no policy file, auto selects batch. The policy loads on startup; restart to reload it.</p>
           <p>Limits are per-call estimates, not cumulative budgets or billing guarantees. Direct calls—including auto-selected direct calls—do not have durable batch replay semantics. Existing batch jobs stay on batch when replayed through auto.</p>
+          <h3>Scheduled live calls</h3>
+          <p>Live calls can wait for capacity without becoming Batch requests. Start Kaiiron with <code>--scheduling-policy /absolute/path/scheduling-policy.json</code> and an enabled policy file. The <a href="../plan/">scheduling plan</a> explains the current behavior and release path; the <a href="https://github.com/PatrickAuld/Kaiion/blob/main/examples/scheduling-policy.json">example policy</a> shows the available rules. Scheduled requests wait before HTTP headers arrive, and the queue resets on restart.</p>
         </section>
 
         <section id="jobs" aria-labelledby="jobs-title">
@@ -138,6 +140,6 @@ kaiiron stop</code></pre>
       </div>
     </div>
   </main>
-  <footer class="site-footer wrap"><a class="wordmark" href="../">kaiiron<span aria-hidden="true">.</span></a><p>More room for work that matters.</p><nav aria-label="Footer navigation"><a href="../">Home</a><a href="https://github.com/PatrickAuld/Kaiion">Source</a><a href="https://github.com/PatrickAuld/Kaiion/blob/main/LICENSE">MIT license</a></nav></footer>
+  <footer class="site-footer wrap"><a class="wordmark" href="../">kaiiron<span aria-hidden="true">.</span></a><p>More room for work that matters.</p><nav aria-label="Footer navigation"><a href="../">Home</a><a href="../plan/">Scheduling plan</a><a href="https://github.com/PatrickAuld/Kaiion">Source</a><a href="https://github.com/PatrickAuld/Kaiion/blob/main/LICENSE">MIT license</a></nav></footer>
 </body>
 </html>
