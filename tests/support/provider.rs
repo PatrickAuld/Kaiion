@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -53,6 +54,17 @@ pub struct FakeProviderInner {
     custom_id_override: Mutex<Option<String>>,
     pagination_decoys: AtomicUsize,
     file_response_delay_ms: AtomicUsize,
+    direct_statuses: Mutex<VecDeque<ScriptedDirectResponse>>,
+    direct_observations: Mutex<Vec<(Instant, Value)>>,
+    direct_response_delay_ms: AtomicUsize,
+    active_direct_requests: AtomicUsize,
+    max_active_direct_requests: AtomicUsize,
+}
+
+#[derive(Clone, Debug)]
+struct ScriptedDirectResponse {
+    status: StatusCode,
+    retry_after: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +73,12 @@ pub struct ProviderCall {
     pub authorization: String,
     pub organization: Option<String>,
     pub project: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DirectRequestObservation {
+    pub offset: Duration,
+    pub request: Value,
 }
 
 #[derive(Clone)]
@@ -77,6 +95,7 @@ impl FakeProvider {
     fn router(self) -> Router {
         Router::new()
             .route("/v1/responses", post(fake_direct_response))
+            .route("/v1/models", get(fake_list_models))
             .route("/v1/files", post(fake_upload_file))
             .route("/v1/files/{id}/content", get(fake_file_content))
             .route(
@@ -149,6 +168,65 @@ impl FakeProvider {
 
     pub async fn calls(&self) -> Vec<ProviderCall> {
         self.inner.calls.lock().await.clone()
+    }
+
+    /// Script one or more Responses API replies. A retry-after value is sent
+    /// verbatim, which lets tests exercise provider throttling behavior.
+    pub async fn script_direct_responses(
+        &self,
+        responses: impl IntoIterator<Item = (StatusCode, Option<String>)>,
+    ) {
+        self.inner
+            .direct_statuses
+            .lock()
+            .await
+            .extend(
+                responses
+                    .into_iter()
+                    .map(|(status, retry_after)| ScriptedDirectResponse {
+                        status,
+                        retry_after,
+                    }),
+            );
+    }
+
+    /// Hold direct responses open to make concurrent request admission
+    /// observable in black-box tests.
+    pub fn delay_direct_responses(&self, milliseconds: usize) {
+        self.inner
+            .direct_response_delay_ms
+            .store(milliseconds, Ordering::SeqCst);
+    }
+
+    /// Relative monotonic arrival times for direct requests, in arrival order.
+    pub async fn direct_request_offsets(&self) -> Vec<Duration> {
+        self.direct_observations()
+            .await
+            .into_iter()
+            .map(|observation| observation.offset)
+            .collect()
+    }
+
+    /// Direct requests ordered by provider arrival, with request bodies and
+    /// monotonic offsets from the first request.
+    pub async fn direct_observations(&self) -> Vec<DirectRequestObservation> {
+        let mut observations = self.inner.direct_observations.lock().await.clone();
+        observations.sort_unstable_by_key(|(received_at, _)| *received_at);
+        let Some((first, _)) = observations.first() else {
+            return Vec::new();
+        };
+        let first = *first;
+        observations
+            .into_iter()
+            .map(|(received_at, request)| DirectRequestObservation {
+                offset: received_at.duration_since(first),
+                request,
+            })
+            .collect()
+    }
+
+    pub fn max_concurrent_direct_requests(&self) -> usize {
+        self.inner.max_active_direct_requests.load(Ordering::SeqCst)
     }
 
     pub fn disconnect_next_create_after_accepting(&self) {
@@ -243,8 +321,59 @@ async fn fake_direct_response(
     headers: HeaderMap,
     Json(request): Json<Value>,
 ) -> Response {
+    let received_at = Instant::now();
     provider.record_call("responses", &headers).await;
-    provider.inner.direct_requests.lock().await.push(request);
+    provider
+        .inner
+        .direct_requests
+        .lock()
+        .await
+        .push(request.clone());
+    provider
+        .inner
+        .direct_observations
+        .lock()
+        .await
+        .push((received_at, request));
+    let active = provider
+        .inner
+        .active_direct_requests
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    provider
+        .inner
+        .max_active_direct_requests
+        .fetch_max(active, Ordering::SeqCst);
+    let scripted = provider.inner.direct_statuses.lock().await.pop_front();
+    let delay = provider
+        .inner
+        .direct_response_delay_ms
+        .load(Ordering::SeqCst);
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+    }
+    provider
+        .inner
+        .active_direct_requests
+        .fetch_sub(1, Ordering::SeqCst);
+
+    if let Some(scripted) = scripted {
+        let mut response = Response::new(Body::from(
+            r#"{"error":{"message":"scripted provider response"}}"#,
+        ));
+        *response.status_mut() = scripted.status;
+        if let Some(retry_after) = scripted.retry_after
+            && let Ok(value) = HeaderValue::from_str(&retry_after)
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return response;
+    }
+
     let mut response = Response::new(Body::from(DIRECT_SSE));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -255,6 +384,17 @@ async fn fake_direct_response(
         HeaderValue::from_static("direct-sentinel"),
     );
     response
+}
+
+async fn fake_list_models(State(provider): State<FakeProvider>, headers: HeaderMap) -> Json<Value> {
+    provider.record_call("models", &headers).await;
+    Json(json!({
+        "object": "list",
+        "data": [
+            {"id": "gpt-test", "object": "model", "owned_by": "fake"},
+            {"id": "async-provider-model", "object": "model", "owned_by": "fake"}
+        ]
+    }))
 }
 
 async fn fake_upload_file(

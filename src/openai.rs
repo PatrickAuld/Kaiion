@@ -1,4 +1,6 @@
-use axum::http::{HeaderMap, StatusCode};
+use std::time::{Duration, SystemTime};
+
+use axum::http::{HeaderMap, StatusCode, header::RETRY_AFTER};
 use reqwest::{RequestBuilder, multipart};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -7,7 +9,7 @@ use thiserror::Error;
 use crate::{
     domain::{BatchId, FileId, JobId},
     error::ProxyError,
-    request::{UpstreamAuth, canonical_provider_url},
+    request::{UpstreamAuth, canonical_provider_url, upstream_body},
 };
 
 const CONTROL_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -97,7 +99,17 @@ impl OpenAiClient {
                 request = request.header(name, value);
             }
         }
-        Ok(request.json(body).send().await?)
+        Ok(request.json(&upstream_body(body)?).send().await?)
+    }
+
+    pub async fn list_models(&self, headers: &HeaderMap) -> Result<reqwest::Response, ProxyError> {
+        let mut request = self.http.get(self.url("models"));
+        for (name, value) in headers {
+            if should_forward_request_header(name.as_str()) {
+                request = request.header(name, value);
+            }
+        }
+        Ok(request.send().await?)
     }
 
     pub async fn upload_batch_file(
@@ -292,4 +304,17 @@ pub fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
             target.append(name.clone(), value.clone());
         }
     }
+}
+
+pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let instant = httpdate::parse_http_date(value).ok()?;
+    Some(
+        instant
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }

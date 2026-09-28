@@ -13,6 +13,8 @@ pub mod openai;
 pub mod proxy;
 pub mod request;
 pub mod routing;
+pub mod scheduling;
+pub mod scheduling_policy;
 pub mod sse;
 
 pub use config::{Cli, Command, Config};

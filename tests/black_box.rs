@@ -4,6 +4,8 @@ mod auto_routing;
 mod client_compatibility;
 #[path = "scenarios/durable_jobs.rs"]
 mod durable_jobs;
+#[path = "scenarios/scheduling.rs"]
+mod scheduling;
 mod support;
 
 use std::time::Duration;

@@ -12,6 +12,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 futures-util = "0.3"
+httpdate = "1"
 json5 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }

@@ -53,7 +53,147 @@ pub struct NormalizedRequest {
     pub batch_body: Value,
     pub request_hash: String,
     pub model: String,
+    pub async_alias: bool,
     pub idempotency_hash: Option<String>,
+}
+
+/// Whether an Auto request can be represented by the durable Batch path. A
+/// missing stable identity or Batch-only unsupported field is a reason to keep
+/// the request live; malformed Kaiion identity headers remain errors.
+pub fn batch_supported(body: &Value, headers: &HeaderMap) -> Result<bool, ProxyError> {
+    let Some(object) = body.as_object() else {
+        return Ok(false);
+    };
+    let Some(requested_model) = object
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    if model_alias(requested_model).0.is_empty()
+        || object
+            .get("stream")
+            .is_some_and(|value| !value.is_boolean())
+        || object
+            .get("store")
+            .is_some_and(|value| value != &Value::Bool(false))
+        || object
+            .get("previous_response_id")
+            .is_some_and(|value| !value.is_null())
+        || object
+            .get("conversation")
+            .is_some_and(|value| !value.is_null())
+        || object
+            .get("background")
+            .is_some_and(|value| value != &Value::Bool(false))
+    {
+        return Ok(false);
+    }
+    let session = identity_header(headers, SESSION_HEADER)?;
+    let idempotency = identity_header(headers, IDEMPOTENCY_HEADER)?;
+    Ok(session.is_some()
+        || extract_session_key(object.get("client_metadata")).is_some()
+        || idempotency.is_some())
+}
+
+/// Returns the provider model name and whether the caller used Kaiion's
+/// wait-tolerant virtual alias.
+pub fn model_alias(model: &str) -> (&str, bool) {
+    match model.strip_prefix("async-") {
+        Some(model) => (model, true),
+        None => (model, false),
+    }
+}
+
+/// Make a provider-bound copy of the request, removing Kaiion's virtual model
+/// prefix without changing the caller's request.
+pub fn upstream_body(body: &Value) -> Result<Value, ProxyError> {
+    let mut upstream = body.clone();
+    let object = upstream.as_object_mut().ok_or_else(|| {
+        ProxyError::BadRequest("Responses request must be a JSON object".to_string())
+    })?;
+    if let Some(model) = object.get("model").and_then(Value::as_str) {
+        let (model, alias) = model_alias(model);
+        if alias && model.is_empty() {
+            return Err(ProxyError::BadRequest(
+                "async- model alias must include an upstream model name".into(),
+            ));
+        }
+        object.insert("model".into(), Value::String(model.to_string()));
+    }
+    Ok(upstream)
+}
+
+/// Stable, process-local session key for scheduling. This is separate from
+/// batch request identity, which includes the turn id and is persisted.
+pub fn scheduling_session_id(
+    body: &Value,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ProxyError> {
+    let session = identity_header(headers, SESSION_HEADER)?
+        .or_else(|| extract_thread_id(body.get("client_metadata")));
+    Ok(session.map(|value| {
+        let mut hasher = Sha256::new();
+        hash_component(&mut hasher, b"scheduler-session", &value);
+        hex_digest(hasher.finalize())
+    }))
+}
+
+pub fn estimate_tokens(body: &Value) -> (u64, u64) {
+    let bytes: usize = ["instructions", "input", "tools", "text"]
+        .iter()
+        .filter_map(|key| body.get(key))
+        .map(|value| value.to_string().len())
+        .sum();
+    let input = (bytes as u64).div_ceil(3).saturating_add(32);
+    let output = body
+        .get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    (input, output)
+}
+
+pub fn is_tool_output(body: &Value) -> bool {
+    contains_item_type(
+        latest_input(body),
+        &["function_call_output", "tool_result", "tool_output"],
+    )
+}
+
+pub fn is_user_prompt(body: &Value) -> bool {
+    if is_tool_output(body) {
+        return false;
+    }
+    if body.get("input").is_some_and(Value::is_string) {
+        return true;
+    }
+    contains_user_marker(latest_input(body))
+}
+
+fn latest_input(body: &Value) -> Option<&Value> {
+    match body.get("input") {
+        Some(Value::Array(items)) => items.last(),
+        value => value,
+    }
+}
+
+pub fn response_usage(value: &Value) -> (Option<u64>, Option<u64>, Option<bool>) {
+    let usage = value
+        .get("response")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("usage"))
+        .or_else(|| value.get("usage"));
+    let Some(usage) = usage else {
+        return (None, None, None);
+    };
+    let input = usage.get("input_tokens").and_then(Value::as_u64);
+    let output = usage.get("output_tokens").and_then(Value::as_u64);
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .map(|tokens| tokens > 0);
+    (input, output, cached)
 }
 
 impl NormalizedRequest {
@@ -70,12 +210,18 @@ impl NormalizedRequest {
         let object = batch_body.as_object_mut().ok_or_else(|| {
             ProxyError::BadRequest("Responses request must be a JSON object".to_string())
         })?;
-        let model = object
+        let requested_model = object
             .get("model")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| ProxyError::BadRequest("missing model".to_string()))?
             .to_string();
+        let (model, async_alias) = model_alias(&requested_model);
+        if model.is_empty() {
+            return Err(ProxyError::BadRequest("missing model".to_string()));
+        }
+        let model = model.to_string();
+        object.insert("model".into(), Value::String(model.clone()));
         if object
             .get("stream")
             .is_some_and(|value| !value.is_boolean())
@@ -158,6 +304,7 @@ impl NormalizedRequest {
             batch_body,
             request_hash,
             model,
+            async_alias,
             idempotency_hash,
         })
     }
@@ -237,6 +384,54 @@ fn extract_session_key(client_metadata: Option<&Value>) -> Option<String> {
     hasher.update([0]);
     hasher.update(turn.as_bytes());
     Some(hex_digest(hasher.finalize()))
+}
+
+fn extract_thread_id(client_metadata: Option<&Value>) -> Option<String> {
+    let metadata = client_metadata?.as_object()?;
+    metadata
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            metadata
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+        })
+        .map(str::to_string)
+}
+
+fn contains_item_type(value: Option<&Value>, accepted: &[&str]) -> bool {
+    match value {
+        Some(Value::Array(values)) => values
+            .iter()
+            .any(|value| contains_item_type(Some(value), accepted)),
+        Some(Value::Object(object)) => {
+            object
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| accepted.contains(&kind))
+                || object
+                    .values()
+                    .any(|value| contains_item_type(Some(value), accepted))
+        }
+        _ => false,
+    }
+}
+
+fn contains_user_marker(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::Array(values)) => values.iter().any(|value| contains_user_marker(Some(value))),
+        Some(Value::Object(object)) => {
+            object.get("role").and_then(Value::as_str) == Some("user")
+                || object.get("type").and_then(Value::as_str) == Some("input_text")
+                || object
+                    .get("content")
+                    .is_some_and(|content| contains_user_marker(Some(content)))
+        }
+        Some(Value::String(_)) => true,
+        _ => false,
+    }
 }
 
 fn remove_volatile_codex_metadata(body: &mut Value) {

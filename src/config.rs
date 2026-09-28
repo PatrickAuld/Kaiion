@@ -88,6 +88,10 @@ pub struct Config {
     #[serde(default)]
     pub routing_policy: Option<PathBuf>,
 
+    #[arg(long, global = true, env = "KAIION_SCHEDULING_POLICY")]
+    #[serde(default)]
+    pub scheduling_policy: Option<PathBuf>,
+
     #[arg(long, global = true, env = "KAIION_RESUME_FROM_ENV")]
     #[serde(default)]
     pub resume_from_env: bool,
@@ -121,6 +125,12 @@ impl Config {
         ];
         if let Some(path) = &self.routing_policy {
             args.extend(["--routing-policy".to_string(), path.display().to_string()]);
+        }
+        if let Some(path) = &self.scheduling_policy {
+            args.extend([
+                "--scheduling-policy".to_string(),
+                path.display().to_string(),
+            ]);
         }
         if self.resume_from_env {
             args.push("--resume-from-env".into());

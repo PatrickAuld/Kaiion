@@ -8,7 +8,7 @@ See [the architecture evaluation and implementation roadmap](docs/long-horizon-w
 
 ## Behavior
 
-- `direct` mode transparently forwards `POST /v1/responses` and its SSE response.
+- `direct` mode calls the provider's live Responses endpoint and forwards its JSON or SSE response; an optional scheduling policy may delay dispatch.
 - `batch` mode converts the request into a one-entry Batch API job.
 - Batch status is polled and the completed response is converted back into Responses SSE events.
 - `response.in_progress` events keep Codex's stream alive while Batch inference is pending.
@@ -16,6 +16,7 @@ See [the architecture evaluation and implementation roadmap](docs/long-horizon-w
 - Batch jobs move through a typed durable state machine; each transition is an atomic compare-and-set operation.
 - The incoming API key, organization, and project headers are passed through to OpenAI. Credentials are never persisted; only a SHA-256 credential fingerprint is stored for request isolation.
 - `auto` mode selects direct inference only within explicit per-call cost and premium allowances; uncertain estimates favor batch.
+- An optional scheduling policy queues live requests in memory and releases them against provider/model request and token limits, with per-session priority signals. Explicit batch requests continue to use the Batch API.
 - Detached jobs persist their request bodies and can resume with credentials after restart. No credentials are stored.
 - Pooling, native Anthropic/Chat Completions adapters, harness supervision, and webhooks are not yet included.
 
@@ -49,6 +50,7 @@ Environment variables mirror the CLI options:
 | `KAIION_POLL_INTERVAL_SECONDS` | `5` |
 | `KAIION_IN_PROGRESS_INTERVAL_SECONDS` | `15` |
 | `KAIION_MAX_BODY_BYTES` | `67108864` |
+| `KAIION_SCHEDULING_POLICY` | unset (scheduling disabled) |
 
 The default mode can be overridden per request with `X-Kaiion-Mode: batch` or `X-Kaiion-Mode: direct`, or `X-Kaiion-Mode: auto`.
 
@@ -145,6 +147,7 @@ The suite verifies direct passthrough, API-key/organization/project passthrough,
 
 - `POST /v1/responses`
 - `POST /responses`
+- `GET /v1/models` and `GET /models` — list upstream models with Kaiion's `async-` aliases
 - `GET /healthz`
 - `POST /v1/kaiion/jobs` — submit a durable batch job, return HTTP 202 and `Location`
 - `GET /v1/kaiion/jobs` — list owned jobs, 100 per page; use `?after=<next_after>`
@@ -165,9 +168,23 @@ kaiiron jobs route --request examples/response-request.json
 
 Direct inference must satisfy both `max_direct_cost_usd` and `max_direct_premium_usd` (estimated direct cost minus estimated batch cost, floored at zero). Set the premium to zero when avoiding latency has no economic value. These are **per-call estimates, not a cumulative workflow budget or billing guarantee**.
 
-The estimator counts serialized instructions, input history, tools, and output schema at roughly three bytes per input token, plus framing overhead. It uses the explicit `max_output_tokens` as a conservative output allowance. Missing output limits, medium/high/xhigh/max reasoning, unknown models, and unpriced modalities/hosted tools select batch. No LLM classifier is called and no request parameters or model are downgraded. Caching, actual usage calibration, and total workflow budgets are future work.
+The estimator counts serialized instructions, input history, tools, and output schema at roughly three bytes per input token, plus framing overhead. It uses the explicit `max_output_tokens` as a conservative output allowance. Missing output limits, medium/high/xhigh/max reasoning, unknown models, and unpriced modalities/hosted tools select batch. Cost-aware auto routing does not invoke an LLM classifier or downgrade request parameters or the model. Scheduled-live mode has a separate built-in complexity heuristic for priority. Caching, actual cost calibration, and total workflow budgets are future work.
 
-Responses include `X-Kaiion-Mode` and `X-Kaiion-Route-Reason`. Existing batch jobs stay on batch in auto mode even after policy changes, avoiding a second charge. Explicit direct mode remains passthrough: it does not participate in durable replay. Auto-selected direct calls also retain direct transport/retry semantics; they are not durable jobs.
+Responses include `X-Kaiion-Mode` and `X-Kaiion-Route-Reason`. Existing batch jobs stay on batch in auto mode even after policy changes, avoiding a second charge. When scheduling is disabled, explicit direct mode remains passthrough. Scheduled live calls are process-local and do not participate in durable replay; auto-selected direct calls also are not durable jobs.
+
+## Scheduled live inference
+
+Live inference can also be delayed by an optional scheduling policy while still using the provider's live Responses endpoint. Enable it with `--scheduling-policy` (or `KAIION_SCHEDULING_POLICY`) and set `"enabled": true` in the policy; without an enabled policy, existing direct and batch behavior is unchanged. With scheduling enabled, live/direct requests are queued in memory and dispatched when the configured request and token limits permit. Explicit batch requests still use Batch. In auto mode, Kaiion may choose Batch for a compatible low-priority request when the scheduler recommends it.
+
+For example, start Kaiion in scheduled direct mode with:
+
+```bash
+kaiiron --mode direct --scheduling-policy /absolute/path/scheduling-policy.json start
+```
+
+The policy composes provider-wide and per-model limits. Provider/model limits share quota across credentials by default; set `auth_scoped: true` on a limit for credential-specific accounting. `max_requests` caps a rolling window, while `max_rps` and token caps pace dispatch. Session cache affinity, recent user activity, idle decay, complexity, and the optional `async-` model prefix affect priority; priority does not override a quota. Kaiion adds `async-<model>` aliases to `/v1/models` (and `/models`) as a signal that the caller can wait longer. Kaiion removes the prefix before sending the request upstream; when scheduling is enabled, the alias lowers priority and can use `async_max_wait_ms` for a longer wait. Requests without `max_output_tokens` reserve a conservative 16,384 output-token estimate. Retries are bounded by `max_retries` (2 by default); scheduling honors upstream `Retry-After` only within the finite wait cap. Ambiguous network failures after a provider may have accepted a request cannot be safely retried without upstream idempotency.
+
+The current scheduler queue and quota accounting are process-local. The waiting queue is bounded by `max_pending` entries and `max_pending_bytes` of serialized request bodies. Waiting requests and in-memory accounting are lost on restart, and limits are not coordinated across multiple Kaiion processes or with traffic sent directly to the provider. Use one Kaiion process per provider quota space and leave provider headroom. A request waits before Kaiion returns HTTP headers; this first slice does not send synthetic SSE progress events during that wait, so clients with short request timeouts may disconnect. The wait is bounded, queued work is not durable, and provider cache hits are not guaranteed. For the current policy schema and behavior, see [the scheduling example](examples/scheduling-policy.json) and [the scheduling plan](docs/scheduling-plan.md).
 
 ## Detached workflows
 

@@ -1,0 +1,51 @@
+{
+  "enabled": true,
+  "limits": [
+    {
+      "provider": "https://api.openai.com/v1",
+      "window_seconds": 60,
+      "max_requests": 3000,
+      "max_rps": 50,
+      "max_input_tokens": 1200000,
+      "max_output_tokens": 240000,
+      "max_total_tokens": 1440000
+    },
+    {
+      "provider": "https://api.openai.com/v1",
+      "model": "replace-with-your-model",
+      "window_seconds": 60,
+      "max_requests": 600,
+      "max_rps": 10,
+      "max_input_tokens": 400000,
+      "max_output_tokens": 80000,
+      "max_total_tokens": 480000
+    }
+  ],
+  "max_wait_ms": 30000,
+  "max_retries": 2,
+  "max_pending": 10000,
+  "max_pending_bytes": 134217728,
+  "queue_coalesce_ms": 2,
+  "async_max_wait_ms": 180000,
+  "cache_affinity_window_ms": 60000,
+  "recent_prompt_window_ms": 10000,
+  "idle_decay_ms": 120000,
+  "aging_interval_ms": 1000,
+  "high_priority_threshold": 30,
+  "cache_affinity_boost": 40,
+  "recent_prompt_boost": 30,
+  "tool_output_penalty": 15,
+  "idle_decay_penalty_per_interval": 5,
+  "queue_aging_boost_per_interval": 5,
+  "async_alias_penalty": 20,
+  "batch_on_cache_miss": true,
+  "default_output_tokens": 16384,
+  "complexity": {
+    "low_input_tokens": 2048,
+    "high_input_tokens": 16384,
+    "high_tool_count": 4,
+    "low_priority": 10,
+    "medium_priority": 0,
+    "high_priority": -15
+  }
+}
