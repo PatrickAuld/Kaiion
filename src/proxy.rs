@@ -520,16 +520,12 @@ async fn scheduled_upstream_response(
                 match chunk {
                     Ok(bytes) => {
                         usage.push(&bytes);
-                        if let Some((input, output, cache_hit)) = usage.usage
-                            && let Some(permit) = permit.take()
-                        {
-                            scheduler.complete(permit, input, output, cache_hit).await;
-                        }
                         yield Ok::<Bytes, reqwest::Error>(bytes);
                     }
                     Err(error) => {
                         if let Some(permit) = permit.take() {
-                            scheduler.complete(permit, None, None, None).await;
+                            let (input, output, cache_hit) = usage.usage.unwrap_or((None, None, None));
+                            scheduler.complete(permit, input, output, cache_hit).await;
                         }
                         yield Err(error);
                         return;

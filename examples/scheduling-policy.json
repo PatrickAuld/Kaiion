@@ -19,6 +19,11 @@
       "max_input_tokens": 400000,
       "max_output_tokens": 80000,
       "max_total_tokens": 480000
+    },
+    {
+      "provider": "http://127.0.0.1:11434/v1",
+      "model": "replace-with-your-local-model",
+      "max_concurrency": 1
     }
   ],
   "max_wait_ms": 30000,

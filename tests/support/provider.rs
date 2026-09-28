@@ -57,6 +57,7 @@ pub struct FakeProviderInner {
     direct_statuses: Mutex<VecDeque<ScriptedDirectResponse>>,
     direct_observations: Mutex<Vec<(Instant, Value)>>,
     direct_response_delay_ms: AtomicUsize,
+    direct_response_stream_delay_ms: AtomicUsize,
     active_direct_requests: AtomicUsize,
     max_active_direct_requests: AtomicUsize,
 }
@@ -89,6 +90,14 @@ struct FakeBatch {
     output_file_id: Option<String>,
     error_file_id: Option<String>,
     metadata: Value,
+}
+
+struct ActiveDirectRequestGuard(Arc<FakeProviderInner>);
+
+impl Drop for ActiveDirectRequestGuard {
+    fn drop(&mut self) {
+        self.0.active_direct_requests.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FakeProvider {
@@ -195,6 +204,15 @@ impl FakeProvider {
     pub fn delay_direct_responses(&self, milliseconds: usize) {
         self.inner
             .direct_response_delay_ms
+            .store(milliseconds, Ordering::SeqCst);
+    }
+
+    /// Pause between SSE events while streaming a successful direct response.
+    /// This holds the fake provider's active-request count until the terminal
+    /// response event has been consumed or the stream is dropped.
+    pub fn delay_direct_response_stream(&self, milliseconds: usize) {
+        self.inner
+            .direct_response_stream_delay_ms
             .store(milliseconds, Ordering::SeqCst);
     }
 
@@ -344,6 +362,7 @@ async fn fake_direct_response(
         .inner
         .max_active_direct_requests
         .fetch_max(active, Ordering::SeqCst);
+    let active_guard = ActiveDirectRequestGuard(Arc::clone(&provider.inner));
     let scripted = provider.inner.direct_statuses.lock().await.pop_front();
     let delay = provider
         .inner
@@ -352,12 +371,8 @@ async fn fake_direct_response(
     if delay > 0 {
         tokio::time::sleep(Duration::from_millis(delay as u64)).await;
     }
-    provider
-        .inner
-        .active_direct_requests
-        .fetch_sub(1, Ordering::SeqCst);
-
     if let Some(scripted) = scripted {
+        drop(active_guard);
         let mut response = Response::new(Body::from(
             r#"{"error":{"message":"scripted provider response"}}"#,
         ));
@@ -374,7 +389,40 @@ async fn fake_direct_response(
         return response;
     }
 
-    let mut response = Response::new(Body::from(DIRECT_SSE));
+    let stream_delay = provider
+        .inner
+        .direct_response_stream_delay_ms
+        .load(Ordering::SeqCst);
+    let body = if stream_delay > 0 {
+        let mut events = DIRECT_SSE.split_inclusive("\n\n");
+        let first = Bytes::from(events.next().unwrap_or_default().to_string());
+        let second = Bytes::from(events.next().unwrap_or_default().to_string());
+        let delay = Duration::from_millis(stream_delay as u64);
+        let chunks = stream::unfold((0u8, Some(active_guard)), move |(part, guard)| {
+            let first = first.clone();
+            let second = second.clone();
+            async move {
+                match part {
+                    0 => Some((Ok::<Bytes, std::convert::Infallible>(first), (1, guard))),
+                    1 => {
+                        tokio::time::sleep(delay).await;
+                        Some((Ok::<Bytes, std::convert::Infallible>(second), (2, guard)))
+                    }
+                    2 => {
+                        tokio::time::sleep(delay).await;
+                        drop(guard);
+                        None
+                    }
+                    _ => unreachable!("direct SSE stream emitted more than two events"),
+                }
+            }
+        });
+        Body::from_stream(chunks)
+    } else {
+        drop(active_guard);
+        Body::from(DIRECT_SSE)
+    };
+    let mut response = Response::new(body);
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/event-stream"),

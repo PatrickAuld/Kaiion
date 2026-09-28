@@ -1,9 +1,13 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::http::StatusCode;
 use futures_util::future::join_all;
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio::sync::oneshot;
 
 use crate::support::process::start_kaiion_with_args;
 use crate::support::*;
@@ -296,6 +300,96 @@ async fn fake_provider_records_concurrent_live_request_arrivals() {
     assert_eq!(provider.direct_observations().await.len(), 3);
     assert!(provider.max_concurrent_direct_requests() >= 2);
     kaiion.stop().await;
+}
+
+#[tokio::test]
+async fn provider_wide_concurrency_limit_waits_for_live_call_across_models() {
+    let provider = FakeProvider::default();
+    // Keep the first upstream response open long enough to observe whether the
+    // second request is admitted before the first one finishes.
+    provider.delay_direct_response_stream(500);
+    let fake = spawn_fake_provider(provider.clone()).await;
+    let directory = TempDir::new().unwrap();
+    let kaiion = start_scheduled(
+        "direct",
+        &directory,
+        fake.address,
+        &policy(json!([{"window_seconds": 1, "max_concurrency": 1}]), 0),
+    )
+    .await;
+    let codex = Arc::new(FakeCodex::new(kaiion.address));
+
+    let first_request = request_for("gpt-test", "concurrency-first");
+    let first_client = Arc::clone(&codex);
+    let (terminal_event_tx, terminal_event_rx) = oneshot::channel();
+    let first = tokio::spawn(async move {
+        let mut response = first_client.send(&first_request).await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(
+            response.next_event().await.unwrap().kind,
+            "response.created"
+        );
+        assert_eq!(
+            response.next_event().await.unwrap().kind,
+            "response.completed"
+        );
+        let _ = terminal_event_tx.send(());
+        assert!(response.all_bytes().await.is_empty());
+    });
+
+    wait_for_direct_request_count(&provider, 1).await;
+
+    // Use a different model to ensure a provider-wide limit shares the same
+    // slot pool across models.
+    let second_request = request_for("gpt-other", "concurrency-second");
+    let second_client = Arc::clone(&codex);
+    let second = tokio::spawn(async move {
+        let response = second_client.send(&second_request).await;
+        let status = response.status;
+        (status, response.all_bytes().await)
+    });
+
+    // Confirm the first response's terminal SSE event has arrived while the
+    // provider deliberately keeps its body stream open before EOF.
+    tokio::time::timeout(Duration::from_secs(5), terminal_event_rx)
+        .await
+        .expect("first response stream did not reach its terminal event")
+        .expect("first response task ended before the terminal event");
+
+    // The first provider stream has sent response.completed but has not ended.
+    // The second request must remain queued until the stream reaches EOF.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        provider.direct_observations().await.len(),
+        1,
+        "the second model reached the provider before the first body stream completed"
+    );
+
+    first.await.unwrap();
+    let (second_status, second_bytes) = second.await.unwrap();
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(second_bytes, DIRECT_SSE.as_bytes());
+
+    let observations = provider.direct_observations().await;
+    assert_eq!(observations.len(), 2);
+    assert_eq!(observations[0].request["model"], "gpt-test");
+    assert_eq!(observations[1].request["model"], "gpt-other");
+    assert!(
+        observations[1].offset >= Duration::from_millis(900),
+        "second request was dispatched before the first response stream reached EOF: {observations:?}"
+    );
+    assert_eq!(provider.max_concurrent_direct_requests(), 1);
+    kaiion.stop().await;
+}
+
+async fn wait_for_direct_request_count(provider: &FakeProvider, expected: usize) {
+    for _ in 0..500 {
+        if provider.direct_observations().await.len() >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("Kaiion did not send {expected} direct requests to the provider");
 }
 
 #[tokio::test]

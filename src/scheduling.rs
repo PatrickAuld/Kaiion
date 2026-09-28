@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -118,6 +119,7 @@ pub enum ScheduleOutcome {
 #[derive(Debug)]
 pub struct SchedulePermit {
     reservation_id: Option<u64>,
+    lease: Option<PermitLease>,
     provider: String,
     auth_scope: String,
     model: String,
@@ -155,6 +157,40 @@ struct PendingGuard {
     armed: bool,
 }
 
+struct PermitLease {
+    inner: Arc<Inner>,
+    id: u64,
+    armed: bool,
+}
+
+impl fmt::Debug for PermitLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermitLease")
+            .field("id", &self.id)
+            .field("armed", &self.armed)
+            .finish()
+    }
+}
+
+impl Drop for PermitLease {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let inner = self.inner.clone();
+        let id = self.id;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let mut state = inner.state.lock().await;
+                if state.active.remove(&id).is_some() {
+                    dispatch_available(&inner, &mut state, Instant::now());
+                }
+            });
+        }
+    }
+}
+
 impl PendingGuard {
     fn disarm(&mut self) {
         self.armed = false;
@@ -177,7 +213,7 @@ impl Drop for PendingGuard {
                 }
                 let now = Instant::now();
                 prune_events(&mut state, &inner.policy, now);
-                let _ = dispatch_ready(&inner, &mut state, now);
+                dispatch_available(&inner, &mut state, now);
             });
         }
     }
@@ -187,6 +223,7 @@ impl Drop for PendingGuard {
 struct State {
     events: VecDeque<UsageEvent>,
     pending: HashMap<u64, Pending>,
+    active: HashMap<u64, ActiveRequest>,
     pending_bytes: usize,
     pacing: HashMap<PacingKey, Instant>,
     sessions: HashMap<String, SessionState>,
@@ -203,6 +240,13 @@ struct UsageEvent {
     model: String,
     input_tokens: u64,
     output_tokens: u64,
+}
+
+#[derive(Clone)]
+struct ActiveRequest {
+    provider: String,
+    auth_scope: String,
+    model: String,
 }
 
 struct Pending {
@@ -305,6 +349,7 @@ impl Scheduler {
         if !self.inner.policy.enabled {
             return Ok(ScheduleOutcome::Dispatch(SchedulePermit {
                 reservation_id: None,
+                lease: None,
                 provider: request.provider,
                 auth_scope: request.auth_scope,
                 model: request.model,
@@ -486,13 +531,19 @@ impl Scheduler {
     /// cache-read observations for the next turn in the same session.
     pub async fn complete(
         &self,
-        permit: SchedulePermit,
+        mut permit: SchedulePermit,
         actual_input_tokens: Option<u64>,
         actual_output_tokens: Option<u64>,
         cache_read_hit: Option<bool>,
     ) {
+        if let Some(lease) = permit.lease.as_mut() {
+            lease.armed = false;
+        }
         let now = Instant::now();
         let mut state = self.inner.state.lock().await;
+        if let Some(id) = permit.reservation_id {
+            state.active.remove(&id);
+        }
         if let Some(id) = permit.reservation_id
             && let Some(event) = state.events.iter_mut().find(|event| event.id == id)
         {
@@ -523,18 +574,25 @@ impl Scheduler {
             );
         }
         prune_events(&mut state, &self.inner.policy, now);
+        dispatch_available(&self.inner, &mut state, now);
     }
 
     /// Release a reservation when the request is known not to have reached the
     /// upstream. Use this only for failures before any request bytes were sent.
-    pub async fn abort(&self, permit: SchedulePermit) {
+    pub async fn abort(&self, mut permit: SchedulePermit) {
+        if let Some(lease) = permit.lease.as_mut() {
+            lease.armed = false;
+        }
         let Some(id) = permit.reservation_id else {
             return;
         };
         let mut state = self.inner.state.lock().await;
+        state.active.remove(&id);
         state.events.retain(|event| event.id != id);
         rebuild_pacing(&self.inner.policy, &mut state);
-        prune_events(&mut state, &self.inner.policy, Instant::now());
+        let now = Instant::now();
+        prune_events(&mut state, &self.inner.policy, now);
+        dispatch_available(&self.inner, &mut state, now);
     }
 
     fn capacity_outcome(
@@ -638,7 +696,7 @@ fn batch_recommendation(
     }
 }
 
-fn dispatch_ready(inner: &Inner, state: &mut State, now: Instant) -> Option<Instant> {
+fn dispatch_ready(inner: &Arc<Inner>, state: &mut State, now: Instant) -> Option<Instant> {
     let policy = &inner.policy;
     let queue_ready = state.coalesce_until.is_none_or(|at| now >= at);
     let mut best: Option<(u64, i64, Instant)> = None;
@@ -747,12 +805,25 @@ fn dispatch_ready(inner: &Inner, state: &mut State, now: Instant) -> Option<Inst
                 input_tokens: pending.input_tokens,
                 output_tokens: pending.output_tokens,
             });
+            state.active.insert(
+                reservation_id,
+                ActiveRequest {
+                    provider: pending.request.provider.clone(),
+                    auth_scope: pending.request.auth_scope.clone(),
+                    model: pending.request.model.clone(),
+                },
+            );
             let pacing_request = pending.request.clone();
             let reserved_input = pending.input_tokens;
             let reserved_output = pending.output_tokens;
             let waited = now.saturating_duration_since(pending.enqueued_at);
             let permit = SchedulePermit {
                 reservation_id: Some(reservation_id),
+                lease: Some(PermitLease {
+                    inner: inner.clone(),
+                    id: reservation_id,
+                    armed: true,
+                }),
                 provider: pending.request.provider,
                 auth_scope: pending.request.auth_scope,
                 model: pending.request.model,
@@ -768,6 +839,7 @@ fn dispatch_ready(inner: &Inner, state: &mut State, now: Instant) -> Option<Inst
                 .is_err()
             {
                 state.events.retain(|event| event.id != reservation_id);
+                state.active.remove(&reservation_id);
                 return Some(now);
             }
             update_pacing(
@@ -886,9 +958,42 @@ fn readiness(
             }
         }
     }
+    for limit in policy
+        .limits
+        .iter()
+        .filter(|limit| limit.max_concurrency.is_some() && rule_matches(limit, request))
+    {
+        let active = state
+            .active
+            .values()
+            .filter(|active| active_matches(limit, request, active))
+            .count() as u64;
+        if active >= limit.max_concurrency.unwrap_or_default() {
+            return Fit {
+                at: (ready > now).then_some(ready),
+                impossible: false,
+            };
+        }
+    }
     Fit {
         at: Some(ready),
         impossible: false,
+    }
+}
+
+fn active_matches(limit: &QuotaLimit, request: &ScheduleRequest, active: &ActiveRequest) -> bool {
+    active.provider == request.provider
+        && (!limit.auth_scoped || active.auth_scope == request.auth_scope)
+        && limit
+            .model
+            .as_ref()
+            .is_none_or(|model| model == &active.model)
+}
+
+fn dispatch_available(inner: &Arc<Inner>, state: &mut State, now: Instant) {
+    let mut due = dispatch_ready(inner, state, now);
+    while due.is_some_and(|at| at <= now) {
+        due = dispatch_ready(inner, state, now);
     }
 }
 
@@ -1235,6 +1340,7 @@ mod tests {
             max_input_tokens: None,
             max_output_tokens: None,
             max_total_tokens: None,
+            max_concurrency: None,
         };
         extra(&mut result);
         result
@@ -1367,6 +1473,127 @@ mod tests {
         let state = scheduler.inner.state.lock().await;
         assert!(state.pending.is_empty());
         assert_eq!(state.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_and_model_concurrency_limits_compose_without_head_of_line_blocking() {
+        let scheduler = Scheduler::new(policy(vec![
+            limit(None, |limit| limit.max_concurrency = Some(2)),
+            limit(Some("local-model"), |limit| limit.max_concurrency = Some(1)),
+        ]))
+        .unwrap();
+        let first = match scheduler.acquire(request("local-model")).await.unwrap() {
+            ScheduleOutcome::Dispatch(permit) => permit,
+            outcome => panic!("unexpected {outcome:?}"),
+        };
+
+        let waiting_scheduler = scheduler.clone();
+        let waiter =
+            tokio::spawn(async move { waiting_scheduler.acquire(request("local-model")).await });
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                if scheduler.inner.state.lock().await.pending.len() == 1 {
+                    break;
+                }
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("same-model request should wait for its concurrency slot");
+
+        // A different model can use the second provider-wide slot while the
+        // first model's own limit is full.
+        let other_model = match scheduler.acquire(request("remote-model")).await.unwrap() {
+            ScheduleOutcome::Dispatch(permit) => permit,
+            outcome => panic!("unexpected {outcome:?}"),
+        };
+        scheduler.complete(first, None, None, None).await;
+        let queued = time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("completion should wake the queued request")
+            .unwrap()
+            .unwrap();
+        let queued = match queued {
+            ScheduleOutcome::Dispatch(permit) => permit,
+            outcome => panic!("unexpected {outcome:?}"),
+        };
+        scheduler.complete(other_model, None, None, None).await;
+        scheduler.complete(queued, None, None, None).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_dispatched_permit_releases_its_concurrency_slot() {
+        let scheduler = Scheduler::new(policy(vec![limit(None, |limit| {
+            limit.max_concurrency = Some(1);
+        })]))
+        .unwrap();
+        let first = match scheduler.acquire(request("model")).await.unwrap() {
+            ScheduleOutcome::Dispatch(permit) => permit,
+            outcome => panic!("unexpected {outcome:?}"),
+        };
+        let waiting_scheduler = scheduler.clone();
+        let waiter = tokio::spawn(async move { waiting_scheduler.acquire(request("model")).await });
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                if scheduler.inner.state.lock().await.pending.len() == 1 {
+                    break;
+                }
+                time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("request should be waiting on the occupied slot");
+
+        drop(first);
+        let queued = time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("dropping a permit should release its slot")
+            .unwrap()
+            .unwrap();
+        match queued {
+            ScheduleOutcome::Dispatch(permit) => scheduler.complete(permit, None, None, None).await,
+            outcome => panic!("unexpected {outcome:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_releases_concurrency_and_quota_reservations() {
+        let scheduler = Scheduler::new(policy(vec![limit(None, |limit| {
+            limit.max_concurrency = Some(1);
+            limit.max_requests = Some(1);
+        })]))
+        .unwrap();
+        let first = match scheduler.acquire(request("model")).await.unwrap() {
+            ScheduleOutcome::Dispatch(permit) => permit,
+            outcome => panic!("unexpected {outcome:?}"),
+        };
+        scheduler.abort(first).await;
+        let second = match scheduler.acquire(request("model")).await.unwrap() {
+            ScheduleOutcome::Dispatch(permit) => permit,
+            outcome => panic!("unexpected {outcome:?}"),
+        };
+        scheduler.complete(second, None, None, None).await;
+    }
+
+    #[tokio::test]
+    async fn auth_scoped_concurrency_rules_keep_independent_slots() {
+        let scheduler = Scheduler::new(policy(vec![limit(None, |limit| {
+            limit.max_concurrency = Some(1);
+            limit.auth_scoped = true;
+        })]))
+        .unwrap();
+        let first = match scheduler.acquire(request("model")).await.unwrap() {
+            ScheduleOutcome::Dispatch(permit) => permit,
+            outcome => panic!("unexpected {outcome:?}"),
+        };
+        let mut other_auth = request("model");
+        other_auth.auth_scope = "fingerprint-b".into();
+        let second = match scheduler.acquire(other_auth).await.unwrap() {
+            ScheduleOutcome::Dispatch(permit) => permit,
+            outcome => panic!("unexpected {outcome:?}"),
+        };
+        scheduler.complete(first, None, None, None).await;
+        scheduler.complete(second, None, None, None).await;
     }
 
     #[tokio::test]

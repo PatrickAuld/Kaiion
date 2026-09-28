@@ -82,10 +82,11 @@ impl Default for SchedulingPolicy {
     }
 }
 
-/// A rolling quota for one provider, one model, or both. An omitted provider
-/// or model matches each value independently. `max_rps` and token caps are
-/// paced evenly; `max_requests` is a strict rolling count and may allow a
-/// burst up to that count.
+/// A rolling quota or in-flight concurrency limit for one provider, one model,
+/// or both. An omitted provider or model matches each value independently.
+/// `max_rps` and token caps are paced evenly; `max_requests` is a strict rolling
+/// count and may allow a burst up to that count. `max_concurrency` is
+/// instantaneous and does not use `window_seconds`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaLimit {
@@ -93,10 +94,13 @@ pub struct QuotaLimit {
     pub provider: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
-    /// Provider/model totals aggregate across credentials by default. Set this
-    /// to true to maintain this rule independently for each auth fingerprint.
+    /// Provider/model limits aggregate across credentials by default. Set this
+    /// to true to enforce the rule independently for each auth fingerprint.
     #[serde(default)]
     pub auth_scoped: bool,
+    /// Rolling window for quota fields. It may be omitted for concurrency-only
+    /// rules.
+    #[serde(default)]
     pub window_seconds: u64,
     #[serde(default)]
     pub max_rps: Option<u64>,
@@ -108,6 +112,10 @@ pub struct QuotaLimit {
     pub max_output_tokens: Option<u64>,
     #[serde(default)]
     pub max_total_tokens: Option<u64>,
+    /// Maximum number of matching live requests that may be in flight at once.
+    /// This is instantaneous concurrency and does not use `window_seconds`.
+    #[serde(default)]
+    pub max_concurrency: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,7 +216,14 @@ impl SchedulingPolicy {
         }
 
         for (index, limit) in self.limits.iter().enumerate() {
-            if limit.window_seconds == 0 || limit.window_seconds > MAX_WINDOW_SECONDS {
+            let has_rolling_quota = limit.max_rps.is_some()
+                || limit.max_requests.is_some()
+                || limit.max_input_tokens.is_some()
+                || limit.max_output_tokens.is_some()
+                || limit.max_total_tokens.is_some();
+            if has_rolling_quota
+                && (limit.window_seconds == 0 || limit.window_seconds > MAX_WINDOW_SECONDS)
+            {
                 return Err(format!(
                     "limits[{index}].window_seconds must be between 1 and {MAX_WINDOW_SECONDS}"
                 ));
@@ -218,6 +233,7 @@ impl SchedulingPolicy {
                 && limit.max_input_tokens.is_none()
                 && limit.max_output_tokens.is_none()
                 && limit.max_total_tokens.is_none()
+                && limit.max_concurrency.is_none()
             {
                 return Err(format!("limits[{index}] must define at least one quota"));
             }
@@ -226,6 +242,7 @@ impl SchedulingPolicy {
                 || limit.max_input_tokens == Some(0)
                 || limit.max_output_tokens == Some(0)
                 || limit.max_total_tokens == Some(0)
+                || limit.max_concurrency == Some(0)
             {
                 return Err(format!(
                     "limits[{index}] quota values must be greater than zero"
@@ -248,6 +265,7 @@ impl SchedulingPolicy {
                 ("max_input_tokens", limit.max_input_tokens),
                 ("max_output_tokens", limit.max_output_tokens),
                 ("max_total_tokens", limit.max_total_tokens),
+                ("max_concurrency", limit.max_concurrency),
             ] {
                 if value.is_some_and(|amount| amount > i64::MAX as u64) {
                     return Err(format!("limits[{index}].{field} is too large"));
@@ -294,6 +312,32 @@ mod tests {
         .unwrap();
         assert!(policy.validate().is_ok());
         assert_eq!(policy.limits.len(), 2);
+    }
+
+    #[test]
+    fn parses_and_validates_provider_model_and_auth_scoped_concurrency() {
+        let policy: SchedulingPolicy = serde_json::from_value(json!({
+            "enabled": true,
+            "limits": [
+                {"max_concurrency": 4},
+                {"provider": "local", "model": "llama", "auth_scoped": true,
+                 "max_concurrency": 1}
+            ]
+        }))
+        .unwrap();
+        assert!(policy.validate().is_ok());
+        assert_eq!(policy.limits[0].window_seconds, 0);
+
+        let zero: SchedulingPolicy = serde_json::from_value(json!({
+            "limits": [{"window_seconds": 1, "max_concurrency": 0}]
+        }))
+        .unwrap();
+        assert!(zero.validate().is_err());
+        let overflow: SchedulingPolicy = serde_json::from_value(json!({
+            "limits": [{"window_seconds": 1, "max_concurrency": 18446744073709551615u64}]
+        }))
+        .unwrap();
+        assert!(overflow.validate().is_err());
     }
 
     #[test]

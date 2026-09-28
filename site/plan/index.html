@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="The Kaiiron scheduling plan: keep live inference within provider capacity, prioritize active people and cache opportunities, and move patient work to Batch.">
+  <meta name="description" content="The Kaiiron scheduling plan: coordinate local and hosted inference capacity, protect active sessions, and smooth sudden demand.">
   <meta name="theme-color" content="#193ad0">
   <meta property="og:type" content="website">
   <meta property="og:title" content="The scheduling plan — Kaiiron">
@@ -29,7 +29,7 @@
       <div class="plan-hero-main">
         <p class="eyebrow">THE KAIIRON SCHEDULING PLAN</p>
         <h1 id="plan-title">Make room for<br><span>the next request.</span></h1>
-        <p class="plan-lede">An agent can wait. A person often can’t. Kaiiron can spread live inference across a provider’s capacity window, give active sessions a better place in line, and use Batch when a request has time to spare.</p>
+        <p class="plan-lede">An agent can wait. A person often can’t. Kaiiron can spread live inference across a provider’s capacity window, give active sessions a better place in line, and queue work behind a busy local model.</p>
         <div class="actions">
           <a class="button" href="#how-it-works">Explore the design <span aria-hidden="true">↓</span></a>
           <a class="text-link" href="#roadmap">See what comes next</a>
@@ -38,9 +38,28 @@
       <aside class="plan-status" aria-label="Implementation status">
         <span class="plan-status-kicker">CURRENT RELEASE</span>
         <strong>Scheduled live inference is here.</strong>
-        <p>Opt in with a policy file. The queue and quota ledger run in one Kaiiron process; durable scheduled work is a later phase.</p>
+        <p>Opt in with a policy file. Request, token, and concurrent-call limits run in one Kaiiron process; durable scheduling and dollar budgets are later phases.</p>
         <a href="https://github.com/PatrickAuld/Kaiion/blob/main/examples/scheduling-policy.json">View example policy <span aria-hidden="true">↗</span></a>
       </aside>
+    </section>
+
+    <section id="use-cases" class="section wrap" aria-labelledby="use-cases-title">
+      <div class="plan-section-head">
+        <p class="eyebrow">WHY SCHEDULE</p>
+        <h2 id="use-cases-title">One slot or a million tokens.<br>Both need a queue.</h2>
+      </div>
+      <div class="plan-use-cases">
+        <article>
+          <span class="plan-index">LOCAL INFERENCE / AVAILABLE NOW</span>
+          <h3>Protect a single busy model.</h3>
+          <p>An OpenAI-compatible local endpoint may only handle one useful inference at a time. Set <code>max_concurrency: 1</code> for that provider or model. Kaiiron holds later calls until the live request releases its slot, while still applying any request or token ceilings.</p>
+        </article>
+        <article>
+          <span class="plan-index">SPEND SMOOTHING / IN DESIGN</span>
+          <h3>Keep a surge from becoming a bill.</h3>
+          <p>Request and token windows can pace a large jump in usage today. A future dollar budget will reserve estimated cost across in-flight calls, reconcile provider usage, and bound spend by a configured window. Existing per-call cost routing does not enforce a cumulative budget.</p>
+        </article>
+      </div>
     </section>
 
     <section class="plan-band" aria-labelledby="lanes-title">
@@ -65,7 +84,7 @@
       </div>
       <ol class="plan-steps">
         <li><span>01</span><div><h3>Read the request</h3><p>Resolve the provider model, session, estimated tokens, and whether this is a user prompt or a tool continuation.</p></div></li>
-        <li><span>02</span><div><h3>Check every limit</h3><p>Compose provider-wide and per-model request, input, output, and total-token limits over their configured windows.</p></div></li>
+        <li><span>02</span><div><h3>Check every limit</h3><p>Compose provider-wide and per-model concurrent-call, request, input, output, and total-token limits.</p></div></li>
         <li><span>03</span><div><h3>Order eligible work</h3><p>Consider cache timing, recent human activity, expected complexity, wait-tolerant aliases, and time already spent in line.</p></div></li>
         <li><span>04</span><div><h3>Dispatch and observe</h3><p>Send the unchanged live request except for a resolved <code>async-</code> model name. Reconcile token usage when the response provides it.</p></div></li>
       </ol>
@@ -78,7 +97,7 @@
         <p>Hard limits decide when a request is eligible. Session signals decide which eligible request goes next.</p>
       </div>
       <div class="plan-rule-grid">
-        <article><span class="plan-rule-symbol" aria-hidden="true">↔</span><h3>Smooth the quota window</h3><p>Cap a rolling request count, pace RPS and token use, and apply all matching provider and model ceilings. Provider limits aggregate credentials unless a rule opts into credential scope.</p></article>
+        <article><span class="plan-rule-symbol" aria-hidden="true">↔</span><h3>Smooth the quota window</h3><p>Cap concurrent live calls and rolling request counts, pace RPS and token use, and apply all matching provider and model ceilings. Provider limits aggregate credentials unless a rule opts into credential scope.</p></article>
         <article><span class="plan-rule-symbol" aria-hidden="true">◷</span><h3>Keep cache opportunities close</h3><p>A recent continuation on the same model can earn priority when the prior session showed a cache read. The window is a scheduling hint, never a promised cache hit.</p></article>
         <article><span class="plan-rule-symbol" aria-hidden="true">●</span><h3>Notice a person waiting</h3><p>A quick new user prompt can rise above tool-only continuations. As the session sits idle, its boost fades; queued work ages forward.</p></article>
         <article><span class="plan-rule-symbol" aria-hidden="true">◇</span><h3>Classify the work</h3><p>A built-in heuristic considers token estimates, tools, and reasoning effort. An in-process classifier can replace it without changing the quota rules.</p></article>
@@ -121,8 +140,8 @@
         <p>The first release protects one running process. The next stages address restarts, long waits, and provider feedback.</p>
       </div>
       <div class="plan-roadmap">
-        <article><div class="plan-phase"><span>01</span><strong>AVAILABLE NOW</strong></div><div><h3>Scheduled live lane</h3><p>Composable quotas, paced dispatch, bounded queue and retries, session priority, classifier seam, <code>async-</code> aliases, and eligible Auto-to-Batch recommendations.</p></div></article>
-        <article><div class="plan-phase"><span>02</span><strong>NEXT</strong></div><div><h3>Durable scheduling</h3><p>Persist queue metadata, reservations, and attempt state without storing API keys. Reattach a replay after restart and distinguish an uncertain provider acceptance from a safe retry.</p></div></article>
+        <article><div class="plan-phase"><span>01</span><strong>AVAILABLE NOW</strong></div><div><h3>Scheduled live lane</h3><p>Composable quotas and concurrent-call caps, paced dispatch, bounded queue and retries, session priority, classifier seam, <code>async-</code> aliases, and eligible Auto-to-Batch recommendations.</p></div></article>
+        <article><div class="plan-phase"><span>02</span><strong>NEXT</strong></div><div><h3>Durability and spend budgets</h3><p>Persist queue metadata, reservations, and attempt state without storing API keys. Add a priced, cumulative budget that reserves in-flight spend and reconciles actual usage; unknown prices must not silently count as zero.</p></div></article>
         <article><div class="plan-phase"><span>03</span><strong>DESIGN WORK</strong></div><div><h3>A better long-wait contract</h3><p>Give streaming clients progress while queued without inventing provider response IDs or silently changing upstream status and error behavior.</p></div></article>
         <article><div class="plan-phase"><span>04</span><strong>HARDENING</strong></div><div><h3>Feedback and operations</h3><p>Use provider rate-limit observations, measured versus reserved tokens, queue diagnostics, and load tests to tune headroom and spot stalled work.</p></div></article>
       </div>
